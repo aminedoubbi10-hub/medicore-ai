@@ -24,7 +24,9 @@ api.interceptors.response.use(
   (r) => r,
   async (error: AxiosError) => {
     const orig = error.config as any;
-    if (error.response?.status === 401 && !orig._retry) {
+    const isAuthRoute = orig?.url?.includes('/auth/login') || orig?.url?.includes('/auth/register');
+
+    if (error.response?.status === 401 && !orig._retry && !isAuthRoute && !orig?.skipAuthRefresh) {
       orig._retry = true;
       try {
         const rt = Cookies.get('refresh_token');
@@ -39,14 +41,18 @@ api.interceptors.response.use(
         if (typeof window !== 'undefined') window.location.href = '/login';
       }
     }
-    const msg = (error.response?.data as any)?.detail || error.message || 'Unexpected error';
+
+    const msg =
+      error.code === 'ECONNABORTED'
+        ? 'Backend is not responding yet. Render may still be waking up - wait 30 seconds and try again.'
+        : (error.response?.data as any)?.detail || error.message || 'Unexpected error';
     return Promise.reject(new Error(msg));
   }
 );
 
 export const authAPI = {
   login: (email: string, password: string) =>
-    api.post('/auth/login', { email, password }).then((r) => r.data),
+    api.post('/auth/login', { email, password }, { timeout: 25_000, skipAuthRefresh: true } as any).then((r) => r.data),
   register: (data: any) => api.post('/auth/register', data).then((r) => r.data),
   refresh: (refresh_token: string) =>
     api.post('/auth/refresh', { refresh_token }).then((r) => r.data),
