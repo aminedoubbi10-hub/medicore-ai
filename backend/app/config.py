@@ -60,6 +60,7 @@ class Settings(BaseSettings):
         "https://medicore.vercel.app,"
         "https://medicore-ai-lime.vercel.app"
     )
+    CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
 
     @property
     def cors_origins_list(self) -> list[str]:
