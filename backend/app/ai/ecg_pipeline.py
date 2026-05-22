@@ -20,7 +20,11 @@ Return ONLY valid JSON — no preamble, no markdown."""
 
 class ECGPipeline:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = (
+            anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            if settings.ANTHROPIC_API_KEY
+            else None
+        )
 
     async def analyze(self, file_path: str, patient_context: str = "", clinical_notes: str = "") -> dict:
         start = time.time()
@@ -59,6 +63,9 @@ class ECGPipeline:
         }
 
     async def _claude_interpret(self, features: dict, patient_context: str, clinical_notes: str) -> dict:
+        if self.client is None:
+            return self._demo_fallback(features)
+
         prompt = f"""Analyze ECG measurements and provide clinical interpretation.
 
 MEASUREMENTS:
@@ -101,9 +108,9 @@ Return ONLY this JSON:
             raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(raw)
         except Exception:
-            return self._fallback(features)
+            return self._demo_fallback(features)
 
-    def _fallback(self, f: dict) -> dict:
+    def _demo_fallback(self, f: dict) -> dict:
         hr = f.get("heart_rate", 0)
         return {
             "rhythm": f.get("rhythm", "Unable to determine"),
@@ -121,4 +128,45 @@ Return ONLY this JSON:
             "recommendation": "Manual ECG interpretation by cardiologist required.",
             "redFlags": [],
             "limitations": "AI interpretation unavailable.",
+        }
+
+    def _demo_fallback(self, f: dict) -> dict:
+        hr = f.get("heart_rate", 0)
+        rhythm = f.get("rhythm", "Sinus rhythm")
+        urgency = "urgent" if hr > 120 or hr < 50 else "routine"
+        primary_findings = [
+            rhythm,
+            "No acute ST-segment elevation detected by demo rules",
+            "PR, QRS, and QTc intervals are within expected demo thresholds",
+        ]
+        if hr > 100:
+            primary_findings.append("Tachycardic rate pattern")
+        elif hr < 60:
+            primary_findings.append("Bradycardic rate pattern")
+
+        return {
+            "rhythm": rhythm,
+            "heartRate": f"{hr} bpm",
+            "prInterval": f"{f.get('pr_interval_ms', '?')} ms",
+            "qrsDuration": f"{f.get('qrs_duration_ms', '?')} ms",
+            "qtInterval": f"{f.get('qt_interval_ms', '?')}/{f.get('qtc_interval_ms', '?')} ms",
+            "stChanges": "No acute ST elevation detected in demo interpretation",
+            "axis": f"{f.get('axis_degrees', '?')} degrees",
+            "primaryFindings": primary_findings,
+            "criticalFindings": [],
+            "differentialDiagnosis": [
+                "Normal sinus rhythm variant",
+                "Rate-related sinus rhythm change",
+            ],
+            "confidence": 72,
+            "urgency": urgency,
+            "recommendation": (
+                "Demo ECG interpretation generated without the external AI service. "
+                "Correlate with symptoms, prior ECGs, and clinician review."
+            ),
+            "redFlags": [],
+            "limitations": (
+                "Mock decision-support output for MVP demonstration only; not for diagnosis "
+                "or treatment decisions."
+            ),
         }
