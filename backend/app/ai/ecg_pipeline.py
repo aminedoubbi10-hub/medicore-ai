@@ -110,6 +110,8 @@ class ECGPipeline:
         st_screen = features.get("st_screen") or {}
         representative_lead = features.get("image_waveform_screen", {}).get("representative_lead")
         digitization_quality = features.get("digitization_quality")
+        calibration = features.get("image_waveform_screen", {}).get("calibration", {})
+        lead_segmentation_quality = features.get("image_waveform_screen", {}).get("lead_segmentation_quality")
         rate_flag = "unable_to_assess_rate"
         red_flags = []
         if estimated_hr:
@@ -179,6 +181,14 @@ class ECGPipeline:
                 ),
                 (
                     "PR interval, QT/QTc, and axis cannot be confirmed safely from this ECG image/PDF."
+                ),
+                (
+                    f"ECG grid calibration: {calibration.get('status', 'not detected')}."
+                ),
+                (
+                    f"Lead segmentation quality score: {lead_segmentation_quality}."
+                    if lead_segmentation_quality is not None
+                    else "Lead segmentation quality could not be calculated."
                 ),
                 (
                     f"Digitization quality score: {digitization_quality}."

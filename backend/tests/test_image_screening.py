@@ -27,6 +27,8 @@ def test_ecg_image_returns_preliminary_screen(tmp_path):
     assert "rr_regular" in result["measurements"]
     assert "qrs_duration_ms_estimate" in result["measurements"]
     assert "st_screen" in result["measurements"]
+    assert "calibration" in result["measurements"]["image_waveform_screen"]
+    assert "lead_segmentation_quality" in result["measurements"]["image_waveform_screen"]
 
 
 def test_xray_image_returns_local_review_screen(tmp_path):

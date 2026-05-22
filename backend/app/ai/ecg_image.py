@@ -47,10 +47,11 @@ def load_ecg_document(file_path: str) -> np.ndarray | None:
 
 
 def screen_ecg_image(image_gray: np.ndarray) -> dict:
+    calibration = _detect_grid_calibration(image_gray)
     lead_regions = _segment_leads(image_gray)
     lead_screens = {}
     for lead_name, crop in lead_regions.items():
-        lead_screens[lead_name] = _screen_single_trace(crop)
+        lead_screens[lead_name] = _screen_single_trace(crop, calibration)
 
     usable = {
         lead: screen
@@ -71,6 +72,8 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
             "digitization_quality": 0.0,
             "lead_screens": lead_screens,
             "lead_layout": "attempted_3x4_standard_layout",
+            "calibration": calibration,
+            "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         }
 
     return {
@@ -78,11 +81,13 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
         "representative_lead": representative_lead,
         "lead_screens": lead_screens,
         "lead_layout": "attempted_3x4_standard_layout",
+        "calibration": calibration,
+        "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         "st_screen": st_summary,
     }
 
 
-def _screen_single_trace(image_gray: np.ndarray) -> dict:
+def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None) -> dict:
     height, width = image_gray.shape[:2]
     trace = _extract_trace(image_gray)
     if trace is None or len(trace) < 100:
@@ -109,10 +114,16 @@ def _screen_single_trace(image_gray: np.ndarray) -> dict:
             "digitization_quality": quality,
         }
 
-    # Standard ECG paper is commonly 25 mm/s. Without calibration detection,
-    # assume the visible strip is roughly 10 seconds if width is typical.
-    assumed_seconds = 10.0
-    pixels_per_second = width / assumed_seconds
+    calibration = calibration or {}
+    if calibration.get("pixels_per_second"):
+        pixels_per_second = float(calibration["pixels_per_second"])
+        timing_source = "detected_grid_spacing"
+        assumed_seconds = round(width / pixels_per_second, 2)
+    else:
+        # Fallback for cropped lead panels where the grid cannot be detected.
+        assumed_seconds = 2.5
+        pixels_per_second = width / assumed_seconds
+        timing_source = "assumed_2_5_second_lead_panel"
     rr_pixels = np.diff(peaks)
     rr_seconds = rr_pixels / pixels_per_second
     estimated_hr = int(round(60 / float(np.median(rr_seconds)))) if len(rr_seconds) else None
@@ -131,8 +142,9 @@ def _screen_single_trace(image_gray: np.ndarray) -> dict:
         "digitization_quality": quality,
         "assumptions": {
             "visible_strip_seconds": assumed_seconds,
-            "paper_speed": "assumed 25 mm/s; not detected",
-            "calibration": "not detected",
+            "paper_speed": calibration.get("paper_speed", "assumed 25 mm/s"),
+            "calibration": calibration.get("status", "not_detected"),
+            "timing_source": timing_source,
             "lead": "single extracted trace; lead identity unknown",
         },
     }
@@ -159,6 +171,79 @@ def _segment_leads(image_gray: np.ndarray) -> dict[str, np.ndarray]:
     if not regions:
         regions["unknown"] = image_gray
     return regions
+
+
+def _detect_grid_calibration(image_gray: np.ndarray) -> dict:
+    """Estimate ECG paper scale from recurring grid lines if visible."""
+    img = image_gray.astype(np.float32)
+    darkness = 255.0 - img
+    vertical_projection = darkness.mean(axis=0)
+    horizontal_projection = darkness.mean(axis=1)
+    x_spacing = _dominant_grid_spacing(vertical_projection)
+    y_spacing = _dominant_grid_spacing(horizontal_projection)
+
+    if not x_spacing and not y_spacing:
+        return {
+            "status": "not_detected",
+            "paper_speed": "assumed 25 mm/s",
+            "pixels_per_second": None,
+            "pixels_per_mv": None,
+        }
+
+    # ECG paper has small 1 mm boxes and large 5 mm boxes. If detected spacing
+    # is large, infer small-box spacing by dividing by 5.
+    small_x = _small_box_spacing(x_spacing) if x_spacing else None
+    small_y = _small_box_spacing(y_spacing) if y_spacing else None
+    pixels_per_second = small_x * 25 if small_x else None
+    pixels_per_mv = small_y * 10 if small_y else None
+
+    return {
+        "status": "detected_grid_spacing",
+        "paper_speed": "25 mm/s assumed after grid detection",
+        "detected_x_spacing_px": round(float(x_spacing), 2) if x_spacing else None,
+        "detected_y_spacing_px": round(float(y_spacing), 2) if y_spacing else None,
+        "small_box_x_px": round(float(small_x), 2) if small_x else None,
+        "small_box_y_px": round(float(small_y), 2) if small_y else None,
+        "pixels_per_second": round(float(pixels_per_second), 2) if pixels_per_second else None,
+        "pixels_per_mv": round(float(pixels_per_mv), 2) if pixels_per_mv else None,
+    }
+
+
+def _dominant_grid_spacing(projection: np.ndarray) -> float | None:
+    projection = projection.astype(float)
+    if len(projection) < 80:
+        return None
+    projection = (projection - np.mean(projection)) / (np.std(projection) + 1e-6)
+    peaks, _ = find_peaks(projection, distance=5, prominence=0.2)
+    if len(peaks) < 4:
+        return None
+    spacings = np.diff(peaks)
+    spacings = spacings[(spacings >= 6) & (spacings <= 120)]
+    if len(spacings) == 0:
+        return None
+    hist, edges = np.histogram(spacings, bins=30)
+    idx = int(np.argmax(hist))
+    if hist[idx] == 0:
+        return None
+    return float((edges[idx] + edges[idx + 1]) / 2)
+
+
+def _small_box_spacing(spacing: float) -> float:
+    return spacing / 5 if spacing >= 25 else spacing
+
+
+def _lead_segmentation_quality(lead_screens: dict[str, dict]) -> float:
+    if not lead_screens:
+        return 0.0
+    usable = [
+        screen
+        for screen in lead_screens.values()
+        if screen.get("image_screen_status") == "image_waveform_screen_completed"
+    ]
+    digitization = [float(screen.get("digitization_quality", 0)) for screen in usable]
+    usable_ratio = len(usable) / len(lead_screens)
+    quality = usable_ratio * (float(np.mean(digitization)) if digitization else 0)
+    return round(max(0.0, min(1.0, quality)), 3)
 
 
 def _territory_st_summary(lead_screens: dict[str, dict]) -> dict:
