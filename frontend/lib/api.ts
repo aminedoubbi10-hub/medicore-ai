@@ -69,6 +69,15 @@ export const ecgAPI = {
 export const xrayAPI = {
   upload: (form: FormData) =>
     api.post('/xray/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((r) => r.data),
+  getResult: (id: string) => api.get(`/xray/${id}/result`).then((r) => r.data),
+  pollResult: async (id: string, max = 30): Promise<any> => {
+    for (let i = 0; i < max; i++) {
+      const r = await xrayAPI.getResult(id);
+      if (r.status !== 'processing' && r.status !== 'pending') return r;
+      await new Promise((res) => setTimeout(res, 2000));
+    }
+    throw new Error('Analysis timeout - please retry');
+  },
 };
 
 export const labsAPI = {

@@ -13,6 +13,7 @@ import numpy as np
 from app.config import settings
 from app.ai.safety import CLINICAL_DISCLAIMER, pipeline_trace, review_required
 from app.ai.ecg_signal import measure_ecg_signal, parse_waveform_file
+from app.ai.ecg_image import load_ecg_document, screen_ecg_image
 
 SYSTEM_PROMPT = """You are an AI cardiology decision support assistant.
 Analyze ECG data and produce structured clinical reports.
@@ -38,7 +39,7 @@ class ECGPipeline:
         try:
             features = self._extract_features(file_path)
             if (
-                features.get("source") == "non_diagnostic_image_heuristic"
+                features.get("source") == "ecg_image_or_pdf_screen"
                 and features["signal_quality"] >= 0.08
             ):
                 result = self._image_screen_requires_review(features)
@@ -65,14 +66,12 @@ class ECGPipeline:
             return measure_ecg_signal(parsed)
 
         try:
-            import cv2
-
-            img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            img = load_ecg_document(file_path)
             if img is None:
                 return {
                     "estimated_heart_rate_bpm": None,
                     "signal_quality": 0.0,
-                    "source": "unreadable_or_missing_image",
+                    "source": "unreadable_or_missing_image_or_pdf",
                     "measurement_status": "unavailable",
                 }
 
@@ -80,7 +79,8 @@ class ECGPipeline:
             variance = float(np.var(img) / (255**2))
             contrast_score = min(1.0, variance * 20)
             signal_quality = max(0.0, min(1.0, contrast_score * (1.0 - abs(density - 0.5))))
-            estimated_hr = max(40, min(180, int(70 + variance * 180)))
+            image_screen = screen_ecg_image(img)
+            estimated_hr = image_screen.get("estimated_heart_rate_bpm") or max(40, min(180, int(70 + variance * 180)))
         except Exception:
             return {
                 "estimated_heart_rate_bpm": None,
@@ -91,14 +91,25 @@ class ECGPipeline:
         return {
             "estimated_heart_rate_bpm": estimated_hr,
             "signal_quality": signal_quality,
-            "source": "non_diagnostic_image_heuristic",
+            "source": "ecg_image_or_pdf_screen",
             "measurement_status": "image_metadata_only",
             "image_density": round(density, 3),
             "image_variance": round(variance, 4),
+            "image_waveform_screen": image_screen,
+            "rr_regular": image_screen.get("rr_regular"),
+            "rr_variability_ratio": image_screen.get("rr_variability_ratio"),
+            "qrs_duration_ms_estimate": image_screen.get("qrs_duration_ms_estimate"),
+            "st_screen": image_screen.get("st_screen"),
+            "digitization_quality": image_screen.get("digitization_quality"),
         }
 
     def _image_screen_requires_review(self, features: dict) -> dict:
         estimated_hr = features.get("estimated_heart_rate_bpm")
+        qrs_ms = features.get("qrs_duration_ms_estimate")
+        rr_regular = features.get("rr_regular")
+        st_screen = features.get("st_screen") or {}
+        representative_lead = features.get("image_waveform_screen", {}).get("representative_lead")
+        digitization_quality = features.get("digitization_quality")
         rate_flag = "unable_to_assess_rate"
         red_flags = []
         if estimated_hr:
@@ -114,37 +125,81 @@ class ECGPipeline:
         return {
             "ai_assisted": True,
             "diagnostic_status": "preliminary_image_screen_requires_review",
-            **review_required("ECG image screening is not a validated diagnostic interpretation.", "cardiologist"),
+            **review_required("ECG image/PDF screening is not a validated diagnostic interpretation.", "cardiologist"),
             "safety_flags": ["ecg_image_not_validated_for_diagnosis"],
-            "rhythm": "Unable to determine rhythm safely from ECG image",
+            "rhythm": (
+                "Regular rhythm pattern by RR screen" if rr_regular is True
+                else "Irregular rhythm pattern or indeterminate by RR screen" if rr_regular is False
+                else "Unable to determine rhythm safely from ECG image/PDF"
+            ),
             "heartRate": f"{estimated_hr} bpm (rough image-derived estimate)" if estimated_hr else "Unable to determine safely",
             "prInterval": "Unable to measure safely from image",
-            "qrsDuration": "Unable to measure safely from image",
+            "qrsDuration": f"{qrs_ms} ms (rough image-derived estimate)" if qrs_ms else "Unable to measure safely from image",
             "qtInterval": "Unable to measure safely from image",
-            "stChanges": "Unable to assess ST changes safely from image",
+            "stChanges": (
+                "Possible ST screen flag - physician review required"
+                if st_screen.get("possible_st_elevation")
+                else "No ST screen flag by unvalidated image heuristic"
+                if st_screen
+                else "Unable to assess ST changes safely from image"
+            ),
             "axis": "Unable to determine safely from image",
             "measurements": {
                 **features,
                 "rate_screen": rate_flag,
-                "measurement_warning": "Image-derived screening only; waveform digitization/lead calibration not validated.",
+                "measurement_warning": "Image/PDF-derived screening only; waveform digitization/lead calibration not validated.",
             },
             "primaryFindings": [
-                "Preliminary ECG image screening completed.",
-                "No definitive rhythm, interval, axis, or ischemia interpretation is provided.",
-                f"Rate screen: {rate_flag}.",
+                (
+                    "Preliminary interpretation: the uploaded ECG image/PDF is readable enough "
+                    "for basic automated screening."
+                ),
+                (
+                    f"Estimated heart rate is approximately {estimated_hr} bpm from extracted ECG trace"
+                    + (f" in lead {representative_lead}." if representative_lead else ".")
+                    if estimated_hr
+                    else "Heart rate could not be estimated reliably from this image/PDF."
+                ),
+                (
+                    f"RR regularity screen: {'regular' if rr_regular else 'irregular or indeterminate'}."
+                    if rr_regular is not None
+                    else "RR regularity could not be estimated reliably."
+                ),
+                (
+                    f"Estimated QRS duration is approximately {qrs_ms} ms from image digitization."
+                    if qrs_ms
+                    else "QRS duration could not be estimated reliably from this image/PDF."
+                ),
+                (
+                    "Possible ST elevation screen flag detected in contiguous lead territory - urgent physician review is required."
+                    if st_screen.get("possible_st_elevation")
+                    else "No possible ST elevation screen flag detected by the unvalidated image heuristic."
+                    if st_screen
+                    else "ST screening could not be performed reliably."
+                ),
+                (
+                    "PR interval, QT/QTc, and axis cannot be confirmed safely from this ECG image/PDF."
+                ),
+                (
+                    f"Digitization quality score: {digitization_quality}."
+                    if digitization_quality is not None
+                    else "Digitization quality could not be calculated."
+                ),
             ],
-            "criticalFindings": [],
+            "criticalFindings": [
+                "Possible ST elevation screen flag detected - urgent physician review required."
+            ] if st_screen.get("possible_st_elevation") else [],
             "differentialDiagnosis": [],
             "confidence": 25,
-            "urgency": "urgent" if red_flags else "routine",
+            "urgency": "emergent" if st_screen.get("possible_st_elevation") else "urgent" if red_flags else "routine",
             "recommendation": (
-                "Use this only as a triage aid. Upload native ECG waveform data when possible "
-                "and obtain cardiologist review before clinical use."
+                "Preliminary AI-assisted screening only. Please check this result with a physician/cardiologist. "
+                "Upload native ECG waveform data when possible for more reliable measurement."
             ),
             "redFlags": red_flags,
             "limitations": (
                 "ECG image digitization, calibration, lead segmentation, PR/QRS/QT measurement, "
-                "and STEMI assessment are not validated in this MVP."
+                "and STEMI assessment are not validated in this MVP. PDF/image uploads can vary widely."
             ),
             "clinical_disclaimer": CLINICAL_DISCLAIMER,
             "pipeline_trace": pipeline_trace(

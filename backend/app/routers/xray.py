@@ -1,10 +1,12 @@
 """app/routers/xray.py"""
 import uuid
-from fastapi import APIRouter, Depends, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, UploadFile, File, Form, BackgroundTasks, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from app.database import get_db
 from app.models.user import User
 from app.models.study import Study
+from app.models.ai_result import AIResult
 from app.dependencies import require_doctor
 from app.utils.file_utils import validate_file, generate_unique_filename, ensure_upload_dir
 from app.config import settings
@@ -89,3 +91,43 @@ async def upload_xray(
 
     background_tasks.add_task(_run_xray, str(study.id), file_path, clinical_notes)
     return {"study_id": str(study.id), "status": "processing"}
+
+
+@router.get("/{study_id}/result")
+async def get_xray_result(
+    study_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_doctor),
+):
+    study = await db.get(Study, uuid.UUID(study_id))
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    if study.status in ("pending", "processing"):
+        return {"status": study.status}
+
+    res = await db.execute(select(AIResult).where(AIResult.study_id == study.id))
+    ai = res.scalar_one_or_none()
+    if not ai:
+        return {"status": "processing"}
+
+    findings = ai.raw_findings or {}
+    return {
+        "status": "completed",
+        "study_id": str(study.id),
+        "urgency": ai.urgency or "routine",
+        "confidence_score": float(ai.confidence_score) if ai.confidence_score else 0,
+        "findings": findings,
+        "primary_findings": ai.primary_findings or [],
+        "critical_flags": ai.critical_flags or [],
+        "differential_diagnosis": ai.differential_dx or [],
+        "recommendation": ai.recommendation or "",
+        "requires_physician_review": bool(findings.get("requires_physician_review", True)),
+        "review_status": findings.get("review_status", "pending_radiologist_review"),
+        "diagnostic_status": findings.get("diagnostic_status", "unknown"),
+        "clinical_disclaimer": findings.get("clinical_disclaimer"),
+        "disclaimer": (
+            "AI-assisted radiology screening only. Not a definitive diagnosis. "
+            "Final interpretation must be made by a qualified radiologist/physician."
+        ),
+    }

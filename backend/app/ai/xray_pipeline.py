@@ -125,32 +125,51 @@ urgency, recommendation, criticalFindings, diagnostic_status, limitations."""
         validation = model_result.get("validation", {})
         urgent_flags = validation.get("urgent_flags", [])
         review_flags = validation.get("review_flags", [])
+        probabilities = model_result.get("probabilities", {})
+        sorted_probabilities = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
+        top_findings = sorted_probabilities[:3]
+        local_screen = model_result.get("model_name") == "local_unvalidated_cxr_image_screen"
+        findings = [
+            {
+                "region": "Overall",
+                "finding": f"Preliminary review flag: {finding.replace('_', ' ')} ({probabilities.get(finding, 0):.0%} uncalibrated screen score)",
+                "severity": "indeterminate",
+            }
+            for finding in urgent_flags + review_flags
+        ]
+        if not findings:
+            findings = [
+                {
+                    "region": "Overall",
+                    "finding": (
+                        "Preliminary image screen did not cross local review thresholds. "
+                        "This does not exclude disease."
+                    ),
+                    "severity": "indeterminate",
+                }
+            ]
+        if top_findings:
+            findings.append(
+                {
+                    "region": "Screening Scores",
+                    "finding": "Highest uncalibrated screen scores: "
+                    + ", ".join(f"{name.replace('_', ' ')} {score:.0%}" for name, score in top_findings),
+                    "severity": "indeterminate",
+                }
+            )
         return self._apply_safety_defaults(
             {
                 "technique": "Chest radiograph image submitted",
-                "findings": [
-                    {
-                        "region": "Overall",
-                        "finding": f"Model review flag: {finding}",
-                        "severity": "indeterminate",
-                    }
-                    for finding in urgent_flags + review_flags
-                ] or [
-                    {
-                        "region": "Overall",
-                        "finding": "No model threshold crossed; radiologist review still required.",
-                        "severity": "indeterminate",
-                    }
-                ],
+                "findings": findings,
                 "impression": (
-                    "Preliminary image screening requires radiologist confirmation."
-                    if model_result.get("model_name") == "local_unvalidated_cxr_image_screen"
+                    "Preliminary AI-assisted chest X-ray screen. No definitive diagnosis is provided; radiologist confirmation is required."
+                    if local_screen
                     else "Specialized model probabilities require radiologist confirmation."
                 ),
                 "differentialDx": [],
                 "confidence": 50 if urgent_flags or review_flags else 30,
                 "urgency": "emergent" if urgent_flags else "urgent" if review_flags else "routine",
-                "recommendation": "Radiologist confirmation required before clinical use.",
+                "recommendation": "Preliminary AI-assisted screening only. Please check this result with a physician/radiologist before clinical use.",
                 "criticalFindings": urgent_flags,
                 "diagnostic_status": "model_screen_requires_review",
                 "limitations": model_result.get("limitations", "Model screen is not a definitive radiology interpretation."),

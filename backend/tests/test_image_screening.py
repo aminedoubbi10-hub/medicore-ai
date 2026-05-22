@@ -23,6 +23,10 @@ def test_ecg_image_returns_preliminary_screen(tmp_path):
     assert result["diagnostic_status"] == "preliminary_image_screen_requires_review"
     assert result["requires_physician_review"] is True
     assert result["confidence"] == 25
+    assert "estimated_heart_rate_bpm" in result["measurements"]
+    assert "rr_regular" in result["measurements"]
+    assert "qrs_duration_ms_estimate" in result["measurements"]
+    assert "st_screen" in result["measurements"]
 
 
 def test_xray_image_returns_local_review_screen(tmp_path):

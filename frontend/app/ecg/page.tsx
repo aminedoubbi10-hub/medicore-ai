@@ -36,7 +36,14 @@ export default function ECGPage() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: { 'image/*': ['.png', '.jpg', '.jpeg'], 'application/pdf': ['.pdf'] },
+    accept: {
+      'image/*': ['.png', '.jpg', '.jpeg'],
+      'application/pdf': ['.pdf'],
+      'text/csv': ['.csv'],
+      'text/plain': ['.txt'],
+      'application/xml': ['.xml'],
+      'text/xml': ['.xml'],
+    },
     maxSize: 100 * 1024 * 1024,
     multiple: false,
   });
@@ -74,10 +81,9 @@ export default function ECGPage() {
       }
     } catch (err: any) {
       clearInterval(stepInterval);
-      // Demo fallback with mock result
-      setResult(DEMO_RESULT);
+      setResult({ ...SAFE_ECG_FALLBACK, primaryFindings: [err.message || SAFE_ECG_FALLBACK.primaryFindings[0]] });
       setState('complete');
-      toast.success('ECG analysis complete (demo mode)');
+      toast.error('ECG analysis could not complete safely');
     }
   };
 
@@ -331,6 +337,27 @@ function Section({ title, titleColor, children }: { title: string; titleColor?: 
     </div>
   );
 }
+
+const SAFE_ECG_FALLBACK = {
+  diagnostic_status: 'unable_to_interpret_safely',
+  rhythm: 'Unable to determine safely',
+  heartRate: 'Unable to determine safely',
+  prInterval: 'Unable to measure safely',
+  qrsDuration: 'Unable to measure safely',
+  qtInterval: 'Unable to measure safely',
+  stChanges: 'Unable to assess safely',
+  axis: 'Unable to determine safely',
+  primaryFindings: [
+    'Unable to complete ECG analysis safely.',
+    'Please check the ECG with a physician/cardiologist.',
+  ],
+  criticalFindings: [],
+  differentialDiagnosis: [],
+  confidence: 0,
+  urgency: 'urgent',
+  recommendation: 'Preliminary AI-assisted screening only. Please check this ECG with a physician/cardiologist.',
+  redFlags: [],
+};
 
 const DEMO_RESULT = {
   rhythm: 'Sinus tachycardia with ectopic beats',
