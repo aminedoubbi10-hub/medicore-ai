@@ -38,6 +38,8 @@ class Settings(BaseSettings):
 
     # Anthropic Claude
     ANTHROPIC_API_KEY: str = ""
+    RADIOLOGY_MODEL_URL: str = ""
+    RADIOLOGY_MODEL_TIMEOUT_SECONDS: int = 20
 
     # Rate limiting
     RATE_LIMIT_PER_MINUTE: int = 60

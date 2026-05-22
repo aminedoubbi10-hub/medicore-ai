@@ -25,22 +25,34 @@ async def _run_xray(study_id: str, file_path: str, patient_context: str):
         study = await db.get(Study, uuid.UUID(study_id))
         if not study:
             return
-        study.status = "completed" if result.get("success") else "failed"
-        if result.get("success"):
-            ai = AIResult(
-                study_id=study.id,
-                model_name="MediCore CXR + Claude",
-                model_version="2.4.1",
-                confidence_score=result.get("confidence", 0),
-                urgency=result.get("urgency", "routine"),
-                raw_findings=result,
-                primary_findings=[f.get("finding", "") for f in result.get("findings", [])],
-                critical_flags=result.get("emergency_flags", []),
-                differential_dx=result.get("differentialDx", []),
-                recommendation=result.get("recommendation", ""),
-                heatmap_path=result.get("heatmap_path"),
+        study.status = "completed"
+        study.urgency = result.get("urgency", "routine")
+        ai = AIResult(
+            study_id=study.id,
+            model_name="MediCore Radiology Safety Gate",
+            model_version="2.4.1",
+            confidence_score=result.get("confidence", 0),
+            urgency=result.get("urgency", "routine"),
+            raw_findings=result,
+            measurements=result.get("image_quality", {}),
+            primary_findings=[f.get("finding", "") for f in result.get("findings", [])],
+            critical_flags=result.get("emergency_flags", []) + result.get("criticalFindings", []),
+            differential_dx=result.get("differentialDx", []),
+            recommendation=result.get("recommendation", ""),
+            heatmap_path=result.get("heatmap_path"),
+        )
+        db.add(ai)
+        if result.get("requires_physician_review"):
+            db.add(
+                Alert(
+                    patient_id=None,
+                    study_id=study.id,
+                    alert_type="radiology_review_required",
+                    severity="critical" if result.get("urgency") == "emergent" else "warning",
+                    title="Radiology Requires Physician Review",
+                    description=result.get("impression", "Radiologist confirmation required."),
+                )
             )
-            db.add(ai)
         await db.commit()
 
 

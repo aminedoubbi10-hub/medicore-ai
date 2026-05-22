@@ -1,6 +1,8 @@
-"""app/ai/claude_client.py — Shared Claude API client for report generation."""
+"""Shared Claude API client for report generation."""
 import json
+
 import anthropic
+
 from app.config import settings
 
 _client: anthropic.Anthropic | None = None
@@ -19,20 +21,25 @@ async def generate_report(
     language: str = "en",
     clinical_notes: str = "",
 ) -> str:
-    """Generate a professional hospital-grade medical report using Claude."""
+    """Generate a conservative AI-assisted draft report."""
     lang_names = {"en": "English", "fr": "French", "ar": "Arabic"}
     lang_name = lang_names.get(language, "English")
 
-    prompt = f"""Generate a professional hospital-grade {study_type.upper()} medical report in {lang_name}.
+    prompt = f"""Generate a conservative AI-assisted {study_type.upper()} draft report in {lang_name}.
 
 AI FINDINGS:
 {json.dumps(ai_findings, indent=2)}
 
 ADDITIONAL CLINICAL NOTES: {clinical_notes or 'None provided'}
 
-Write in formal clinical language suitable for a hospital medical record.
+Rules:
+- Do not add diagnoses or findings absent from the supplied AI findings.
+- Preserve uncertainty, low-confidence, review-pending, and unable-to-interpret states.
+- State that this is AI-assisted, not definitive, and requires physician validation.
+- If confidence is low or review is pending, make that prominent.
+
 Structure: Patient info placeholder, Clinical history, Findings, Impression, Recommendations.
-End with: "AI-GENERATED DRAFT — Requires review and countersignature by attending physician."
+End with: "AI-ASSISTED DRAFT - Requires review and countersignature by attending physician."
 
 Return only the report text, no JSON wrapper."""
 
@@ -44,11 +51,12 @@ Return only the report text, no JSON wrapper."""
             messages=[{"role": "user", "content": prompt}],
         )
         return response.content[0].text.strip()
-    except Exception as e:
+    except Exception as exc:
         return (
-            f"[AUTO-GENERATED REPORT — {study_type.upper()}]\n\n"
+            f"[AI-ASSISTED DRAFT - {study_type.upper()}]\n\n"
             f"AI findings summary:\n{json.dumps(ai_findings, indent=2)}\n\n"
             f"Additional notes: {clinical_notes}\n\n"
-            "AI-GENERATED DRAFT — Requires review and countersignature by attending physician.\n"
-            f"(Report generation error: {str(e)})"
+            "This report is not a definitive diagnosis. It requires review and countersignature by "
+            "the attending physician before clinical use.\n"
+            f"(Report generation error: {str(exc)})"
         )

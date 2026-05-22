@@ -34,21 +34,17 @@ async def _run_ecg_analysis(study_id: str, file_path: str, patient_id: str, clin
         if not study:
             return
 
-        if not result.get("success"):
-            study.status = "failed"
-            await db.commit()
-            return
-
         study.status = "completed"
         study.urgency = result.get("urgency", "routine")
 
         ai = AIResult(
             study_id=study.id,
-            model_name="MediCore ECG + Claude",
+            model_name="MediCore ECG Safety Gate",
             model_version="2.4.1",
             confidence_score=result.get("confidence", 0),
             urgency=result.get("urgency", "routine"),
             raw_findings=result,
+            measurements=result.get("measurements", {}),
             primary_findings=result.get("primaryFindings", []),
             critical_flags=result.get("criticalFindings", []),
             differential_dx=result.get("differentialDiagnosis", []),
@@ -58,14 +54,22 @@ async def _run_ecg_analysis(study_id: str, file_path: str, patient_id: str, clin
         )
         db.add(ai)
 
-        if result.get("urgency") == "emergent" or result.get("criticalFindings"):
+        if (
+            result.get("urgency") in {"urgent", "emergent"}
+            or result.get("criticalFindings")
+            or result.get("requires_physician_review")
+        ):
+            try:
+                parsed_patient_id = uuid.UUID(patient_id)
+            except ValueError:
+                parsed_patient_id = None
             alert = Alert(
-                patient_id=uuid.UUID(patient_id),
+                patient_id=parsed_patient_id,
                 study_id=study.id,
-                alert_type="ecg_critical",
-                severity="critical",
-                title="Critical ECG Finding",
-                description="; ".join(result.get("criticalFindings", [])),
+                alert_type="ecg_review_required",
+                severity="critical" if result.get("urgency") == "emergent" else "warning",
+                title="ECG Requires Physician Review",
+                description="; ".join(result.get("primaryFindings", [])),
             )
             db.add(alert)
 
@@ -81,7 +85,7 @@ async def upload_ecg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_doctor),
 ):
-    await validate_file(file, allowed_extensions=["png", "jpg", "jpeg", "pdf", "edf", "xml"], max_size_mb=settings.MAX_FILE_SIZE_MB)
+    await validate_file(file, allowed_extensions=["png", "jpg", "jpeg", "pdf", "edf", "xml", "csv", "txt"], max_size_mb=settings.MAX_FILE_SIZE_MB)
 
     upload_dir = ensure_upload_dir(f"{settings.UPLOAD_DIR}/ecg/{patient_id}")
     safe_name = generate_unique_filename(file.filename)
@@ -138,14 +142,19 @@ async def get_ecg_result(
         "urgency": ai.urgency if ai else "routine",
         "confidence_score": float(ai.confidence_score) if ai and ai.confidence_score else None,
         "findings": ai.raw_findings if ai else {},
+        "measurements": ai.measurements if ai else {},
         "primary_findings": ai.primary_findings or [],
         "critical_flags": ai.critical_flags or [],
         "differential_diagnosis": ai.differential_dx or [],
         "recommendation": ai.recommendation or "",
+        "requires_physician_review": bool((ai.raw_findings or {}).get("requires_physician_review")) if ai else True,
+        "review_status": (ai.raw_findings or {}).get("review_status", "pending_physician_review") if ai else "pending_physician_review",
+        "diagnostic_status": (ai.raw_findings or {}).get("diagnostic_status", "unknown") if ai else "unknown",
+        "clinical_disclaimer": (ai.raw_findings or {}).get("clinical_disclaimer") if ai else None,
         "heatmap_url": ai.heatmap_path if ai else None,
         "disclaimer": (
             "AI decision support only. Confidence: "
             f"{float(ai.confidence_score) if ai and ai.confidence_score else 0}%. "
-            "Final interpretation must be by a licensed physician."
+            "Not a definitive diagnosis. Final interpretation must be by a licensed physician."
         ),
     }

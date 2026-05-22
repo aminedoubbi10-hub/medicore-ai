@@ -7,7 +7,7 @@ from fastapi import UploadFile, HTTPException
 
 ALLOWED_EXTENSIONS = {
     "png", "jpg", "jpeg", "pdf",
-    "dcm", "edf", "xml", "hl7", "zip",
+    "dcm", "edf", "xml", "hl7", "zip", "csv", "txt",
 }
 
 

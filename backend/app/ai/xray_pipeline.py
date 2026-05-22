@@ -1,123 +1,113 @@
-"""app/ai/xray_pipeline.py — Chest X-ray analysis pipeline."""
+"""Conservative chest X-ray decision-support pipeline.
+
+This module does not diagnose radiology findings from heuristics. Without a
+validated radiology model/service it returns an "unable to interpret safely"
+state and requires radiologist review.
+"""
 import json
 import time
-import numpy as np
-import anthropic
-from app.config import settings
 
-THRESHOLDS = {
-    "pneumonia": 0.45, "effusion": 0.40, "pneumothorax": 0.35,
-    "cardiomegaly": 0.50, "pulm_edema": 0.45, "fibrosis": 0.50,
-    "tb_pattern": 0.45, "nodule": 0.40,
-}
-EMERGENCY = ["pneumothorax"]
+import anthropic
+import numpy as np
+
+from app.config import settings
+from app.ai.safety import CLINICAL_DISCLAIMER, pipeline_trace, review_required
+from app.ai.radiology_model import run_radiology_model
+
+EMERGENCY_REVIEW_TERMS = {"pneumothorax", "tension pneumothorax"}
 
 
 class XRayPipeline:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = (
+            anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            if settings.ANTHROPIC_API_KEY
+            else None
+        )
 
     async def analyze(self, file_path: str, patient_context: str = "") -> dict:
         start = time.time()
         try:
             image = self._load(file_path)
-            preprocessed = self._preprocess(image)
-            probs = self._detect(preprocessed)
-            heatmap_path = self._heatmap(image, probs, file_path)
-            report = await self._claude_report(probs, patient_context)
-            emergencies = [c for c in EMERGENCY if probs.get(c, 0) >= THRESHOLDS[c]]
-            return {
-                "success": True,
-                "processing_time_ms": int((time.time() - start) * 1000),
-                "pathology_probabilities": probs,
-                "emergency_flags": emergencies,
-                "heatmap_path": heatmap_path,
-                **report,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            quality = self._quality(image)
+            if quality["diagnostic_quality"] == "poor":
+                report = self._unable_to_interpret(
+                    quality,
+                    "Image quality is insufficient for safe AI-assisted radiology interpretation.",
+                )
+            else:
+                model_result = await run_radiology_model(file_path)
+                if not model_result.get("available"):
+                    report = self._unable_to_interpret(quality, model_result.get("reason", "Radiology model unavailable."))
+                else:
+                    report = await self._report(quality, model_result, patient_context)
+
+            report["success"] = True
+            report["processing_time_ms"] = int((time.time() - start) * 1000)
+            return report
+        except Exception as exc:
+            report = self._unable_to_interpret({}, f"Radiology pipeline failed: {exc}")
+            report["success"] = True
+            report["processing_time_ms"] = int((time.time() - start) * 1000)
+            return report
 
     def _load(self, path: str):
         try:
             import cv2
+
             if path.lower().endswith(".dcm"):
                 import pydicom
+
                 dcm = pydicom.dcmread(path)
                 arr = dcm.pixel_array.astype(np.float32)
                 arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255).astype(np.uint8)
                 return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
             return cv2.imread(path)
         except Exception:
-            return np.zeros((512, 512, 3), dtype=np.uint8)
+            return None
 
-    def _preprocess(self, image) -> np.ndarray:
-        try:
-            import cv2
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            resized = cv2.resize(enhanced, (224, 224))
-            return resized.astype(np.float32) / 255.0
-        except Exception:
-            return np.zeros((224, 224), dtype=np.float32)
-
-    def _detect(self, preprocessed: np.ndarray) -> dict:
-        """Pathology detection. Production: replace with CheXNet DenseNet-121."""
-        density = float(np.mean(preprocessed))
-        variance = float(np.var(preprocessed))
+    def _quality(self, image) -> dict:
+        if image is None:
+            return {
+                "diagnostic_quality": "poor",
+                "quality_score": 0,
+                "reason": "Image could not be read.",
+            }
+        gray = image.mean(axis=2) if image.ndim == 3 else image
+        contrast = float(np.std(gray) / 255)
+        brightness = float(np.mean(gray) / 255)
+        quality_score = max(0.0, min(1.0, contrast * 4))
+        diagnostic_quality = "poor" if quality_score < 0.15 else "limited" if quality_score < 0.35 else "reviewable"
         return {
-            "pneumonia":    min(0.95, density * 1.8),
-            "effusion":     min(0.90, density * 1.4),
-            "pneumothorax": min(0.40, variance * 2.0),
-            "cardiomegaly": min(0.85, density * 1.6),
-            "pulm_edema":   min(0.70, density * 1.3),
-            "fibrosis":     min(0.45, variance * 3.0),
-            "tb_pattern":   min(0.35, density * 1.1),
-            "nodule":       min(0.50, variance * 2.5),
+            "diagnostic_quality": diagnostic_quality,
+            "quality_score": round(quality_score, 3),
+            "brightness": round(brightness, 3),
+            "contrast": round(contrast, 3),
+            "reason": "Quality heuristic only; not a diagnostic image validation.",
         }
 
-    def _heatmap(self, image, probs: dict, file_path: str) -> str:
-        try:
-            import cv2
-            h, w = image.shape[:2]
-            attention = np.zeros((h, w), dtype=np.float32)
-            if probs.get("pneumonia", 0) > 0.3:
-                attention[int(h * 0.5):, :] += probs["pneumonia"]
-            if probs.get("cardiomegaly", 0) > 0.3:
-                cx, cy = w // 2, int(h * 0.5)
-                cv2.ellipse(attention, (cx, cy), (int(w * 0.2), int(h * 0.2)), 0, 0, 360, probs["cardiomegaly"], -1)
-            attention = cv2.GaussianBlur(attention, (51, 51), 0)
-            norm = cv2.normalize(attention, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            heatmap = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-            overlay = cv2.addWeighted(image, 0.55, heatmap, 0.45, 0)
-            out_path = file_path.rsplit(".", 1)[0] + "_heatmap.jpg"
-            cv2.imwrite(out_path, overlay)
-            return out_path
-        except Exception:
-            return ""
+    async def _report(self, quality: dict, model_result: dict, patient_context: str) -> dict:
+        if self.client is None:
+            return self._model_summary_without_llm(quality, model_result)
 
-    async def _claude_report(self, probs: dict, patient_context: str) -> dict:
-        significant = {k: v for k, v in probs.items() if v >= THRESHOLDS.get(k, 0.4)}
-        summary = "\n".join(f"- {k.replace('_',' ').title()}: {v:.1%}" for k, v in sorted(probs.items(), key=lambda x: -x[1]))
+        prompt = f"""Create a conservative AI-assisted chest X-ray review note.
 
-        prompt = f"""Chest X-ray AI detection results. Generate structured radiology report.
+Image quality metadata:
+{json.dumps(quality, indent=2)}
 
-PATHOLOGY PROBABILITIES:
-{summary}
+Specialized model output:
+{json.dumps(model_result, indent=2)}
 
-SIGNIFICANT (above threshold): {list(significant.keys()) or ['None']}
-PATIENT CONTEXT: {patient_context or 'Not provided'}
+Patient context: {patient_context or "Not provided"}
 
-Return ONLY JSON:
-{{
-  "technique": "string",
-  "findings": [{{"region":"string","finding":"string","severity":"normal|mild|moderate|severe"}}],
-  "impression": "string",
-  "differentialDx": ["string"],
-  "confidence": 0,
-  "urgency": "routine|urgent|emergent",
-  "recommendation": "string"
-}}"""
+Rules:
+- Do not overcall pathology.
+- If findings are uncertain, say unable to determine.
+- Require radiologist confirmation.
+- Do not claim a definitive diagnosis.
+
+Return JSON with technique, findings, impression, differentialDx, confidence,
+urgency, recommendation, criticalFindings, diagnostic_status, limitations."""
 
         try:
             response = self.client.messages.create(
@@ -126,14 +116,111 @@ Return ONLY JSON:
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
+            return self._apply_safety_defaults(json.loads(raw), quality, model_result)
         except Exception:
-            return {
-                "technique": "Chest radiograph",
-                "findings": [{"region": "Overall", "finding": "AI unavailable — manual review required", "severity": "normal"}],
-                "impression": "Manual radiologist review required.",
-                "differentialDx": ["Manual review required"],
-                "confidence": 0,
-                "urgency": "routine",
-                "recommendation": "Qualified radiologist review required.",
-            }
+            return self._model_summary_without_llm(quality, model_result)
+
+    def _model_summary_without_llm(self, quality: dict, model_result: dict) -> dict:
+        validation = model_result.get("validation", {})
+        urgent_flags = validation.get("urgent_flags", [])
+        review_flags = validation.get("review_flags", [])
+        return self._apply_safety_defaults(
+            {
+                "technique": "Chest radiograph image submitted",
+                "findings": [
+                    {
+                        "region": "Overall",
+                        "finding": f"Model review flag: {finding}",
+                        "severity": "indeterminate",
+                    }
+                    for finding in urgent_flags + review_flags
+                ] or [
+                    {
+                        "region": "Overall",
+                        "finding": "No model threshold crossed; radiologist review still required.",
+                        "severity": "indeterminate",
+                    }
+                ],
+                "impression": "Specialized model probabilities require radiologist confirmation.",
+                "differentialDx": [],
+                "confidence": 50 if urgent_flags or review_flags else 30,
+                "urgency": "emergent" if urgent_flags else "urgent" if review_flags else "routine",
+                "recommendation": "Radiologist confirmation required before clinical use.",
+                "criticalFindings": urgent_flags,
+                "diagnostic_status": "model_screen_requires_review",
+                "limitations": "External model screen is not a definitive radiology interpretation.",
+            },
+            quality,
+            model_result,
+        )
+
+    def _apply_safety_defaults(self, result: dict, quality: dict, model_result: dict | None = None) -> dict:
+        result.setdefault("ai_assisted", True)
+        result.setdefault("diagnostic_status", "ai_assisted_requires_review")
+        result.setdefault("requires_physician_review", True)
+        result.setdefault("review_recommended_specialty", "radiology")
+        result.setdefault("review_status", "pending_radiologist_review")
+        result.setdefault("image_quality", quality)
+        result.setdefault("model_result", model_result or {})
+        result.setdefault("confidence", 0)
+        result.setdefault("criticalFindings", [])
+        result.setdefault("emergency_flags", [])
+        result.setdefault("clinical_disclaimer", self._clinical_disclaimer())
+        result.setdefault(
+            "pipeline_trace",
+            pipeline_trace(
+                modality="radiology",
+                deterministic_preprocessing="completed",
+                specialized_model="external_validated_service_attempted",
+                validation_layer="applied",
+                llm_role="formatting_and_explanation_only",
+                final_gate="requires_radiologist_review",
+            ),
+        )
+        if result.get("confidence", 0) < 70:
+            result["diagnostic_status"] = "uncertain_requires_review"
+        for finding in result.get("criticalFindings", []):
+            if any(term in finding.lower() for term in EMERGENCY_REVIEW_TERMS):
+                result["emergency_flags"].append(finding)
+                result["urgency"] = "emergent"
+        return result
+
+    def _unable_to_interpret(self, quality: dict, reason: str) -> dict:
+        return {
+            "ai_assisted": True,
+            "diagnostic_status": "unable_to_interpret_safely",
+            **review_required(reason, "radiologist"),
+            "technique": "Chest radiograph image submitted",
+            "findings": [
+                {
+                    "region": "Overall",
+                    "finding": "Unable to provide safe AI-assisted radiology interpretation.",
+                    "severity": "indeterminate",
+                }
+            ],
+            "impression": "Insufficient validated data/service for radiology interpretation.",
+            "differentialDx": [],
+            "confidence": 0,
+            "urgency": "urgent",
+            "recommendation": (
+                "Do not use this output for diagnosis. Obtain qualified radiologist review."
+            ),
+            "criticalFindings": [],
+            "emergency_flags": [],
+            "image_quality": quality,
+            "heatmap_path": "",
+            "pathology_probabilities": {},
+            "limitations": reason,
+            "clinical_disclaimer": self._clinical_disclaimer(),
+            "pipeline_trace": pipeline_trace(
+                modality="radiology",
+                deterministic_preprocessing="completed",
+                specialized_model="not_configured_or_unavailable",
+                validation_layer="blocked_diagnostic_output",
+                llm_role="not_used_for_raw_diagnosis",
+                final_gate="unable_to_interpret_safely",
+            ),
+        }
+
+    def _clinical_disclaimer(self) -> str:
+        return CLINICAL_DISCLAIMER
