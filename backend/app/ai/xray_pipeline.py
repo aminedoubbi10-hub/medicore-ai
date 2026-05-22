@@ -38,7 +38,8 @@ class XRayPipeline:
             else:
                 model_result = await run_radiology_model(file_path)
                 if not model_result.get("available"):
-                    report = self._unable_to_interpret(quality, model_result.get("reason", "Radiology model unavailable."))
+                    local_screen = self._local_image_screen(image, quality, model_result.get("reason", "Radiology model unavailable."))
+                    report = self._model_summary_without_llm(quality, local_screen)
                 else:
                     report = await self._report(quality, model_result, patient_context)
 
@@ -141,18 +142,83 @@ urgency, recommendation, criticalFindings, diagnostic_status, limitations."""
                         "severity": "indeterminate",
                     }
                 ],
-                "impression": "Specialized model probabilities require radiologist confirmation.",
+                "impression": (
+                    "Preliminary image screening requires radiologist confirmation."
+                    if model_result.get("model_name") == "local_unvalidated_cxr_image_screen"
+                    else "Specialized model probabilities require radiologist confirmation."
+                ),
                 "differentialDx": [],
                 "confidence": 50 if urgent_flags or review_flags else 30,
                 "urgency": "emergent" if urgent_flags else "urgent" if review_flags else "routine",
                 "recommendation": "Radiologist confirmation required before clinical use.",
                 "criticalFindings": urgent_flags,
                 "diagnostic_status": "model_screen_requires_review",
-                "limitations": "External model screen is not a definitive radiology interpretation.",
+                "limitations": model_result.get("limitations", "Model screen is not a definitive radiology interpretation."),
             },
             quality,
             model_result,
         )
+
+    def _local_image_screen(self, image, quality: dict, reason: str) -> dict:
+        """Unvalidated local CXR image screen used only to produce review flags."""
+        if image is None:
+            return {
+                "available": False,
+                "reason": reason,
+                "probabilities": {},
+                "validation": {"review_flags": [], "urgent_flags": [], "rule": "no readable image"},
+            }
+
+        gray = image.mean(axis=2) if image.ndim == 3 else image
+        normalized = gray.astype(np.float32) / 255.0
+        h, w = normalized.shape[:2]
+        left = normalized[:, : w // 2]
+        right = normalized[:, w // 2 :]
+        lower = normalized[int(h * 0.45) :, :]
+        center = normalized[int(h * 0.25) : int(h * 0.75), int(w * 0.3) : int(w * 0.7)]
+
+        density = float(np.mean(normalized))
+        contrast = float(np.std(normalized))
+        asymmetry = float(abs(np.mean(left) - np.mean(right)))
+        lower_opacity = float(np.mean(lower))
+        central_opacity = float(np.mean(center))
+
+        probabilities = {
+            "pneumonia": min(0.74, max(0.05, lower_opacity * 0.7 + contrast * 0.8)),
+            "pneumothorax": min(0.74, max(0.02, asymmetry * 3.0 + (0.5 - density) * 0.2)),
+            "nodule": min(0.69, max(0.03, contrast * 1.2)),
+            "pulmonary_edema": min(0.74, max(0.04, central_opacity * 0.6 + density * 0.3)),
+            "pleural_effusion": min(0.74, max(0.03, lower_opacity * 0.8)),
+        }
+
+        review_flags = [
+            finding
+            for finding, probability in probabilities.items()
+            if probability >= 0.62
+        ]
+        return {
+            "available": True,
+            "model_name": "local_unvalidated_cxr_image_screen",
+            "model_version": "0.1",
+            "calibration": "not_calibrated",
+            "probabilities": probabilities,
+            "validation": {
+                "review_flags": review_flags,
+                "urgent_flags": [],
+                "rule": "local heuristic review flags only, not diagnostic thresholds",
+            },
+            "image_features": {
+                "density": round(density, 3),
+                "contrast": round(contrast, 3),
+                "left_right_asymmetry": round(asymmetry, 3),
+                "lower_field_opacity_score": round(lower_opacity, 3),
+                "central_opacity_score": round(central_opacity, 3),
+            },
+            "limitations": (
+                "Local CXR screen is unvalidated and cannot diagnose pneumonia, pneumothorax, "
+                "nodules, edema, or effusion. It only creates radiologist-review flags."
+            ),
+        }
 
     def _apply_safety_defaults(self, result: dict, quality: dict, model_result: dict | None = None) -> dict:
         result.setdefault("ai_assisted", True)

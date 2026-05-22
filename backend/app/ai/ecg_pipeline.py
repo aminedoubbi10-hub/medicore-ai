@@ -37,7 +37,12 @@ class ECGPipeline:
         start = time.time()
         try:
             features = self._extract_features(file_path)
-            if features["signal_quality"] < 0.35:
+            if (
+                features.get("source") == "non_diagnostic_image_heuristic"
+                and features["signal_quality"] >= 0.08
+            ):
+                result = self._image_screen_requires_review(features)
+            elif features["signal_quality"] < 0.35:
                 result = self._unable_to_interpret(
                     features,
                     "ECG image quality is too low for safe automated interpretation.",
@@ -88,6 +93,68 @@ class ECGPipeline:
             "signal_quality": signal_quality,
             "source": "non_diagnostic_image_heuristic",
             "measurement_status": "image_metadata_only",
+            "image_density": round(density, 3),
+            "image_variance": round(variance, 4),
+        }
+
+    def _image_screen_requires_review(self, features: dict) -> dict:
+        estimated_hr = features.get("estimated_heart_rate_bpm")
+        rate_flag = "unable_to_assess_rate"
+        red_flags = []
+        if estimated_hr:
+            if estimated_hr > 120:
+                rate_flag = "tachycardic_rate_screen"
+                red_flags.append("high_rate_screen_requires_review")
+            elif estimated_hr < 50:
+                rate_flag = "bradycardic_rate_screen"
+                red_flags.append("low_rate_screen_requires_review")
+            else:
+                rate_flag = "rate_within_screening_range"
+
+        return {
+            "ai_assisted": True,
+            "diagnostic_status": "preliminary_image_screen_requires_review",
+            **review_required("ECG image screening is not a validated diagnostic interpretation.", "cardiologist"),
+            "safety_flags": ["ecg_image_not_validated_for_diagnosis"],
+            "rhythm": "Unable to determine rhythm safely from ECG image",
+            "heartRate": f"{estimated_hr} bpm (rough image-derived estimate)" if estimated_hr else "Unable to determine safely",
+            "prInterval": "Unable to measure safely from image",
+            "qrsDuration": "Unable to measure safely from image",
+            "qtInterval": "Unable to measure safely from image",
+            "stChanges": "Unable to assess ST changes safely from image",
+            "axis": "Unable to determine safely from image",
+            "measurements": {
+                **features,
+                "rate_screen": rate_flag,
+                "measurement_warning": "Image-derived screening only; waveform digitization/lead calibration not validated.",
+            },
+            "primaryFindings": [
+                "Preliminary ECG image screening completed.",
+                "No definitive rhythm, interval, axis, or ischemia interpretation is provided.",
+                f"Rate screen: {rate_flag}.",
+            ],
+            "criticalFindings": [],
+            "differentialDiagnosis": [],
+            "confidence": 25,
+            "urgency": "urgent" if red_flags else "routine",
+            "recommendation": (
+                "Use this only as a triage aid. Upload native ECG waveform data when possible "
+                "and obtain cardiologist review before clinical use."
+            ),
+            "redFlags": red_flags,
+            "limitations": (
+                "ECG image digitization, calibration, lead segmentation, PR/QRS/QT measurement, "
+                "and STEMI assessment are not validated in this MVP."
+            ),
+            "clinical_disclaimer": CLINICAL_DISCLAIMER,
+            "pipeline_trace": pipeline_trace(
+                modality="ecg",
+                deterministic_preprocessing="image_quality_and_density_screen_completed",
+                specialized_model="not_configured_or_unavailable",
+                validation_layer="blocked_definitive_ecg_diagnosis",
+                llm_role="not_used_for_raw_diagnosis",
+                final_gate="preliminary_image_screen_requires_cardiologist_review",
+            ),
         }
 
     async def _interpret(self, features: dict, patient_context: str, clinical_notes: str) -> dict:
