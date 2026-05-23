@@ -103,6 +103,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
+          <div className="px-2.5 pt-2 text-[10px] tracking-wide"
+            style={{ color: 'var(--text3)', opacity: 0.45 }}>
+            made by amine
+          </div>
         </div>
       </aside>
 

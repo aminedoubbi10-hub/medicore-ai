@@ -62,7 +62,7 @@ export default function ECGPage() {
       setState('processing');
       const form = new FormData();
       form.append('file', file);
-      form.append('patient_id', patientId.replace('#', '') || 'demo');
+      form.append('patient_id', patientId.replace('#', '') || 'unassigned');
       form.append('clinical_notes', clinicalNotes);
 
       const { study_id } = await ecgAPI.upload(form);
@@ -115,7 +115,7 @@ export default function ECGPage() {
               <p className="text-sm font-medium mb-1">{file ? `✓ ${file.name}` : 'Drop ECG file or click to browse'}</p>
               <p className="text-xs mb-3" style={{ color: 'var(--text3)' }}>PNG, JPG, PDF · Max 100 MB</p>
               <div className="flex gap-1.5 justify-center flex-wrap">
-                {['PNG/JPG', 'PDF', 'EDF', 'XML/HL7', 'MUSE'].map((f) => (
+                {['PNG/JPG', 'PDF', 'CSV', 'TXT', 'XML'].map((f) => (
                   <span key={f} className="text-[10px] px-2 py-0.5 rounded"
                     style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text3)' }}>{f}</span>
                 ))}
@@ -142,7 +142,7 @@ export default function ECGPage() {
               className="mt-4 w-full py-2.5 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 transition-all disabled:opacity-50"
               style={{ background: 'linear-gradient(135deg,var(--accent2),#005588)', color: 'white' }}>
               <Activity className="w-4 h-4" />
-              {state === 'uploading' ? 'Uploading...' : state === 'processing' ? 'Analyzing with AI...' : 'Analyze with AI'}
+              {state === 'uploading' ? 'Uploading...' : state === 'processing' ? 'Screening ECG...' : 'Screen ECG'}
             </button>
           </div>
 
@@ -181,7 +181,7 @@ export default function ECGPage() {
               <div className="text-center" style={{ color: 'var(--text3)' }}>
                 <Activity className="w-12 h-12 mx-auto mb-3 opacity-30" />
                 <p className="text-sm">Upload an ECG and click Analyze</p>
-                <p className="text-xs mt-1">AI will detect cardiac abnormalities</p>
+                <p className="text-xs mt-1">Image quality, rhythm, QRS and ST screening</p>
               </div>
             </div>
           )}
@@ -388,37 +388,4 @@ const SAFE_ECG_FALLBACK = {
   urgency: 'urgent',
   recommendation: 'Preliminary AI-assisted screening only. Please check this ECG with a physician/cardiologist.',
   redFlags: [],
-};
-
-const DEMO_RESULT = {
-  rhythm: 'Sinus tachycardia with ectopic beats',
-  heartRate: '112 bpm',
-  prInterval: '164 ms (normal)',
-  qrsDuration: '118 ms (borderline)',
-  qtInterval: '440 ms / QTc borderline prolonged',
-  stChanges: 'ST elevation 2mm in II, III, aVF · reciprocal depression I, aVL',
-  axis: '+75° (normal)',
-  primaryFindings: [
-    'ST elevation in inferior leads (II, III, aVF) — pattern consistent with inferior STEMI',
-    'Reciprocal ST depression in lateral leads I and aVL',
-    'Sinus tachycardia — likely secondary to pain/stress response',
-    'Q waves developing in III — possible early infarct evolution',
-  ],
-  criticalFindings: [
-    'INFERIOR STEMI PATTERN DETECTED — Emergent cardiology consultation required',
-    'Immediate 12-lead correlation and troponin sampling indicated',
-  ],
-  differentialDiagnosis: [
-    'Acute inferior STEMI (TIMI risk: high)',
-    'Right ventricular infarction (obtain V4R)',
-    'Pericarditis (less likely — regional not diffuse changes)',
-  ],
-  confidence: 94,
-  urgency: 'emergent',
-  recommendation: 'Emergent cardiology consultation. Initiate STEMI protocol. Obtain right-sided leads (V3R, V4R). Draw troponin I/T, BMP, CBC. Avoid nitroglycerin until RV involvement excluded.',
-  redFlags: [
-    'Inferior STEMI pattern',
-    'Borderline QTc — avoid QT-prolonging agents',
-    'Sinus tachycardia — may mask compensatory bradycardia',
-  ],
 };

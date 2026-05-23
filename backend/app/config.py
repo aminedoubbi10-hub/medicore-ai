@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    INITIAL_ADMIN_EMAIL: str = "admin@medicore.ai"
+    INITIAL_ADMIN_PASSWORD: str = "Admin1234!"
+    INITIAL_ADMIN_FULL_NAME: str = "MediCore Admin"
 
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./medicore.db"

@@ -44,7 +44,7 @@ export default function XRayPage() {
       } else {
         const form = new FormData();
         form.append('file', file);
-        form.append('patient_id', 'demo');
+        form.append('patient_id', 'unassigned');
         const { study_id } = await xrayAPI.upload(form);
         const res = await xrayAPI.pollResult(study_id);
         setResult(res.findings || res);

@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import structlog
 
 from app.config import settings
-from app.bootstrap import ensure_demo_admin
+from app.bootstrap import ensure_initial_admin
 from app.database import engine, Base, AsyncSessionLocal
 from app import models as _models
 from app.routers import auth, patients, ecg, xray, labs, reports, alerts
@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with AsyncSessionLocal() as db:
-        await ensure_demo_admin(db)
+        await ensure_initial_admin(db)
     yield
     logger.info("MediCore AI shutting down")
     await engine.dispose()

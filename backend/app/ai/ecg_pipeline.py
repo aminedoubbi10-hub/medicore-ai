@@ -14,6 +14,7 @@ from app.config import settings
 from app.ai.safety import CLINICAL_DISCLAIMER, pipeline_trace, review_required
 from app.ai.ecg_signal import measure_ecg_signal, parse_waveform_file
 from app.ai.ecg_image import load_ecg_document, screen_ecg_image
+from app.ai.ecg_rules import build_ecg_screen_interpretation
 
 SYSTEM_PROMPT = """You are an AI cardiology decision support assistant.
 Analyze ECG data and produce structured clinical reports.
@@ -132,47 +133,28 @@ class ECGPipeline:
                 red_flags.append("low_rate_screen_requires_review")
             else:
                 rate_flag = "rate_within_screening_range"
-        confidence = int(
-            max(
-                10,
-                min(
-                    55,
-                    15
-                    + 20 * float(image_quality.get("quality_score", 0) or 0)
-                    + 12 * float(digitization_quality or 0)
-                    + 8 * float(lead_segmentation_quality or 0),
-                ),
-            )
-        )
+        rule_result = build_ecg_screen_interpretation(features)
+        red_flags = list(dict.fromkeys(red_flags + rule_result.get("redFlags", [])))
 
         return {
             "ai_assisted": True,
             "diagnostic_status": "preliminary_image_screen_requires_review",
             **review_required("ECG image/PDF screening is not a validated diagnostic interpretation.", "cardiologist"),
             "safety_flags": ["ecg_image_not_validated_for_diagnosis"],
-            "rhythm": (
-                "Regular rhythm pattern by RR screen" if rr_regular is True
-                else "Irregular rhythm pattern or indeterminate by RR screen" if rr_regular is False
-                else "Unable to determine rhythm safely from ECG image/PDF"
-            ),
-            "heartRate": f"{estimated_hr} bpm (rough image-derived estimate)" if estimated_hr else "Unable to determine safely",
+            "rhythm": rule_result.get("rhythm", "Unable to determine rhythm safely from ECG image/PDF"),
+            "heartRate": rule_result.get("heartRate") or "Unable to determine safely",
             "prInterval": "Unable to measure safely from image",
-            "qrsDuration": f"{qrs_ms} ms (rough image-derived estimate)" if qrs_ms else "Unable to measure safely from image",
+            "qrsDuration": rule_result.get("qrsDuration") or "Unable to measure safely from image",
             "qtInterval": "Unable to measure safely from image",
-            "stChanges": (
-                "Possible ST screen flag - physician review required"
-                if st_screen.get("possible_st_elevation")
-                else "No ST screen flag by unvalidated image heuristic"
-                if st_screen
-                else "Unable to assess ST changes safely from image"
-            ),
+            "stChanges": rule_result.get("stChanges") or "Unable to assess ST changes safely from image",
             "axis": "Unable to determine safely from image",
             "measurements": {
                 **features,
                 "rate_screen": rate_flag,
+                "rule_engine": rule_result.get("rule_engine", {}),
                 "measurement_warning": "Image/PDF-derived screening only; waveform digitization/lead calibration not validated.",
             },
-            "primaryFindings": [
+            "primaryFindings": rule_result.get("primaryFindings", []) + [
                 (
                     "Preliminary interpretation: the uploaded ECG image/PDF is readable enough "
                     "for basic automated screening."
@@ -203,43 +185,18 @@ class ECGPipeline:
                 (
                     "PR interval, QT/QTc, and axis cannot be confirmed safely from this ECG image/PDF."
                 ),
-                (
-                    f"ECG grid calibration: {calibration.get('status', 'not detected')}."
-                ),
-                (
-                    f"Image quality: {image_quality.get('status', 'unknown')} "
-                    f"(score {image_quality.get('quality_score')})."
-                    if image_quality
-                    else "Image quality could not be calculated."
-                ),
-                (
-                    "Image quality warnings: " + ", ".join(quality_warnings) + "."
-                    if quality_warnings
-                    else "No major image quality warnings were detected by the screening heuristic."
-                ),
+                f"ECG grid calibration: {calibration.get('status', 'not detected')}.",
                 (
                     f"Preprocessing applied: contrast normalization, denoising, deskew angle "
                     f"{preprocessing.get('deskew_angle_degrees', 0)} degrees."
                     if preprocessing
                     else "Preprocessing metadata unavailable."
                 ),
-                (
-                    f"Lead segmentation quality score: {lead_segmentation_quality}."
-                    if lead_segmentation_quality is not None
-                    else "Lead segmentation quality could not be calculated."
-                ),
-                (
-                    f"Digitization quality score: {digitization_quality}."
-                    if digitization_quality is not None
-                    else "Digitization quality could not be calculated."
-                ),
             ],
-            "criticalFindings": [
-                "Possible ST elevation screen flag detected - urgent physician review required."
-            ] if st_screen.get("possible_st_elevation") else [],
+            "criticalFindings": rule_result.get("criticalFindings", []),
             "differentialDiagnosis": [],
-            "confidence": confidence,
-            "urgency": "emergent" if st_screen.get("possible_st_elevation") else "urgent" if red_flags else "routine",
+            "confidence": rule_result.get("confidence", 0),
+            "urgency": rule_result.get("urgency", "urgent" if red_flags else "routine"),
             "recommendation": (
                 "Preliminary AI-assisted screening only. Please check this result with a physician/cardiologist. "
                 "Upload native ECG waveform data when possible for more reliable measurement."
@@ -247,7 +204,8 @@ class ECGPipeline:
             "redFlags": red_flags,
             "limitations": (
                 "ECG image digitization, calibration, lead segmentation, PR/QRS/QT measurement, "
-                "and STEMI assessment are not validated in this MVP. PDF/image uploads can vary widely."
+                "and STEMI assessment are not validated in this MVP. PDF/image uploads can vary widely. "
+                + rule_result.get("limitations", "")
             ),
             "clinical_disclaimer": CLINICAL_DISCLAIMER,
             "pipeline_trace": pipeline_trace(

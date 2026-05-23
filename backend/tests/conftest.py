@@ -1,6 +1,6 @@
 import pytest_asyncio
 
-from app.bootstrap import ensure_demo_admin
+from app.bootstrap import ensure_initial_admin
 from app.database import AsyncSessionLocal, Base, engine
 from app import models as _models
 
@@ -10,5 +10,5 @@ async def initialize_test_database():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with AsyncSessionLocal() as db:
-        await ensure_demo_admin(db)
+        await ensure_initial_admin(db)
     yield
