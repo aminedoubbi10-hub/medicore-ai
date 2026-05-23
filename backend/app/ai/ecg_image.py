@@ -47,8 +47,11 @@ def load_ecg_document(file_path: str) -> np.ndarray | None:
 
 
 def screen_ecg_image(image_gray: np.ndarray) -> dict:
-    calibration = _detect_grid_calibration(image_gray)
-    lead_regions = _segment_leads(image_gray)
+    prepared = _prepare_ecg_image(image_gray)
+    working_image = prepared["image"]
+    quality_assessment = _assess_image_quality(working_image, prepared)
+    calibration = _detect_grid_calibration(working_image)
+    lead_regions = _segment_leads(working_image)
     lead_screens = {}
     for lead_name, crop in lead_regions.items():
         lead_screens[lead_name] = _screen_single_trace(crop, calibration)
@@ -73,6 +76,8 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
             "lead_screens": lead_screens,
             "lead_layout": "attempted_3x4_standard_layout",
             "calibration": calibration,
+            "image_quality": quality_assessment,
+            "preprocessing": prepared["metadata"],
             "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         }
 
@@ -82,6 +87,8 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
         "lead_screens": lead_screens,
         "lead_layout": "attempted_3x4_standard_layout",
         "calibration": calibration,
+        "image_quality": quality_assessment,
+        "preprocessing": prepared["metadata"],
         "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         "st_screen": st_summary,
     }
@@ -171,6 +178,174 @@ def _segment_leads(image_gray: np.ndarray) -> dict[str, np.ndarray]:
     if not regions:
         regions["unknown"] = image_gray
     return regions
+
+
+def _prepare_ecg_image(image_gray: np.ndarray) -> dict:
+    """Normalize ECG image for downstream grid/trace extraction."""
+    import cv2
+
+    img = image_gray
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    img = img.astype(np.uint8)
+
+    height, width = img.shape[:2]
+    scale = 1.0
+    target_width = 1800
+    if width < target_width:
+        scale = target_width / max(width, 1)
+        img = cv2.resize(img, (target_width, int(height * scale)), interpolation=cv2.INTER_CUBIC)
+    elif width > 2600:
+        scale = 2600 / width
+        img = cv2.resize(img, (2600, int(height * scale)), interpolation=cv2.INTER_AREA)
+
+    normalized = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+    denoised = cv2.bilateralFilter(normalized, 5, 35, 35)
+    deskewed, angle = _deskew_image(denoised)
+    cropped = _crop_content(deskewed)
+
+    return {
+        "image": cropped,
+        "metadata": {
+            "original_shape": [int(height), int(width)],
+            "processed_shape": [int(cropped.shape[0]), int(cropped.shape[1])],
+            "resize_scale": round(float(scale), 3),
+            "deskew_angle_degrees": round(float(angle), 2),
+            "contrast_normalized": True,
+            "denoised": True,
+        },
+    }
+
+
+def _deskew_image(image_gray: np.ndarray) -> tuple[np.ndarray, float]:
+    import cv2
+
+    edges = cv2.Canny(image_gray, 60, 180)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=max(80, image_gray.shape[1] // 25),
+        minLineLength=max(80, image_gray.shape[1] // 8),
+        maxLineGap=12,
+    )
+    if lines is None:
+        return image_gray, 0.0
+
+    angles = []
+    for line in lines[:, 0]:
+        x1, y1, x2, y2 = line
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if -12 <= angle <= 12:
+            angles.append(angle)
+    if not angles:
+        return image_gray, 0.0
+
+    angle = float(np.median(angles))
+    if abs(angle) < 0.4:
+        return image_gray, angle
+
+    h, w = image_gray.shape[:2]
+    matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    rotated = cv2.warpAffine(
+        image_gray,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return rotated, angle
+
+
+def _crop_content(image_gray: np.ndarray) -> np.ndarray:
+    img = image_gray.astype(np.uint8)
+    threshold = min(245, int(np.percentile(img, 96)))
+    mask = img < threshold
+    rows = np.where(mask.mean(axis=1) > 0.01)[0]
+    cols = np.where(mask.mean(axis=0) > 0.01)[0]
+    if len(rows) < 20 or len(cols) < 20:
+        return image_gray
+    y0, y1 = max(0, rows[0] - 12), min(img.shape[0], rows[-1] + 13)
+    x0, x1 = max(0, cols[0] - 12), min(img.shape[1], cols[-1] + 13)
+    return image_gray[y0:y1, x0:x1]
+
+
+def _assess_image_quality(image_gray: np.ndarray, prepared: dict) -> dict:
+    import cv2
+
+    h, w = image_gray.shape[:2]
+    laplacian_var = float(cv2.Laplacian(image_gray, cv2.CV_64F).var())
+    darkness = 255 - image_gray.astype(np.float32)
+    dark_pixel_ratio = float((image_gray < np.percentile(image_gray, 12)).mean())
+    contrast = float(np.std(image_gray) / 255)
+    grid = _detect_grid_calibration(image_gray)
+    lead_label_score = _lead_label_presence_score(image_gray)
+
+    resolution_score = min(1.0, (w * h) / (1400 * 900))
+    blur_score = min(1.0, laplacian_var / 140)
+    contrast_score = min(1.0, contrast * 5)
+    trace_density_score = 1.0 if 0.01 <= dark_pixel_ratio <= 0.22 else max(0.0, 1.0 - abs(dark_pixel_ratio - 0.08) * 8)
+    grid_score = 1.0 if grid.get("status") == "detected_grid_spacing" else 0.35
+    rotation_penalty = min(0.35, abs(float(prepared["metadata"].get("deskew_angle_degrees", 0))) / 35)
+
+    score = (
+        0.24 * resolution_score
+        + 0.18 * blur_score
+        + 0.18 * contrast_score
+        + 0.18 * trace_density_score
+        + 0.14 * grid_score
+        + 0.08 * lead_label_score
+        - rotation_penalty
+    )
+    score = round(max(0.0, min(1.0, score)), 3)
+
+    warnings = []
+    if resolution_score < 0.45:
+        warnings.append("low_resolution")
+    if blur_score < 0.35:
+        warnings.append("blur_or_soft_focus")
+    if grid.get("status") != "detected_grid_spacing":
+        warnings.append("grid_not_reliably_detected")
+    if lead_label_score < 0.25:
+        warnings.append("lead_labels_not_reliably_detected")
+    if trace_density_score < 0.35:
+        warnings.append("trace_density_outside_expected_range")
+
+    if score >= 0.72:
+        status = "good_for_preliminary_image_screening"
+    elif score >= 0.45:
+        status = "limited_but_screenable"
+    else:
+        status = "poor_quality_interpret_with_caution"
+
+    return {
+        "status": status,
+        "quality_score": score,
+        "resolution_score": round(float(resolution_score), 3),
+        "blur_score": round(float(blur_score), 3),
+        "contrast_score": round(float(contrast_score), 3),
+        "trace_density_score": round(float(trace_density_score), 3),
+        "grid_score": round(float(grid_score), 3),
+        "lead_label_score": round(float(lead_label_score), 3),
+        "warnings": warnings,
+    }
+
+
+def _lead_label_presence_score(image_gray: np.ndarray) -> float:
+    # Lightweight OCR-free proxy: lead labels create compact dark components near
+    # the left edge of each expected panel. This avoids claiming label identity.
+    import cv2
+
+    h, w = image_gray.shape[:2]
+    left_band = image_gray[:, : max(20, int(w * 0.18))]
+    _, binary = cv2.threshold(left_band, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    components = 0
+    for idx in range(1, num_labels):
+        x, y, cw, ch, area = stats[idx]
+        if 6 <= cw <= 80 and 8 <= ch <= 80 and 15 <= area <= 900:
+            components += 1
+    return round(float(min(1.0, components / 10)), 3)
 
 
 def _detect_grid_calibration(image_gray: np.ndarray) -> dict:
@@ -268,21 +443,27 @@ def _territory_st_summary(lead_screens: dict[str, dict]) -> dict:
 
 
 def _extract_trace(image_gray: np.ndarray) -> np.ndarray | None:
+    import cv2
+
     img = image_gray.astype(np.uint8)
-    # Dark pixels are likely trace/text/grid. Use a conservative percentile and
-    # prefer the darkest point per column near the central signal band.
-    threshold = min(120, int(np.percentile(img, 12)))
-    mask = img < threshold
+    enhanced = cv2.equalizeHist(img)
+    threshold = min(135, int(np.percentile(enhanced, 10)))
+    mask = enhanced < threshold
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
     height, width = img.shape[:2]
     ys = np.full(width, np.nan)
+    previous_y = None
     for x in range(width):
         candidates = np.where(mask[:, x])[0]
         if len(candidates) == 0:
             continue
-        # Prefer central candidates to avoid labels and borders.
-        center = height / 2
+        # Prefer continuity once a trace has been found; otherwise use the
+        # central band to avoid labels and panel borders.
+        center = previous_y if previous_y is not None else height / 2
         y = candidates[np.argmin(np.abs(candidates - center))]
         ys[x] = y
+        previous_y = y
     valid = np.isfinite(ys)
     if valid.mean() < 0.2:
         return None

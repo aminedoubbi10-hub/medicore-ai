@@ -75,12 +75,16 @@ class ECGPipeline:
                     "measurement_status": "unavailable",
                 }
 
+            image_screen = screen_ecg_image(img)
+            image_quality = image_screen.get("image_quality", {})
             density = float(np.mean(img) / 255)
             variance = float(np.var(img) / (255**2))
-            contrast_score = min(1.0, variance * 20)
-            signal_quality = max(0.0, min(1.0, contrast_score * (1.0 - abs(density - 0.5))))
-            image_screen = screen_ecg_image(img)
-            estimated_hr = image_screen.get("estimated_heart_rate_bpm") or max(40, min(180, int(70 + variance * 180)))
+            signal_quality = max(
+                float(image_quality.get("quality_score", 0)),
+                float(image_screen.get("digitization_quality", 0) or 0),
+                float(image_screen.get("lead_segmentation_quality", 0) or 0),
+            )
+            estimated_hr = image_screen.get("estimated_heart_rate_bpm")
         except Exception:
             return {
                 "estimated_heart_rate_bpm": None,
@@ -96,6 +100,8 @@ class ECGPipeline:
             "image_density": round(density, 3),
             "image_variance": round(variance, 4),
             "image_waveform_screen": image_screen,
+            "image_quality": image_quality,
+            "preprocessing": image_screen.get("preprocessing", {}),
             "rr_regular": image_screen.get("rr_regular"),
             "rr_variability_ratio": image_screen.get("rr_variability_ratio"),
             "qrs_duration_ms_estimate": image_screen.get("qrs_duration_ms_estimate"),
@@ -112,6 +118,9 @@ class ECGPipeline:
         digitization_quality = features.get("digitization_quality")
         calibration = features.get("image_waveform_screen", {}).get("calibration", {})
         lead_segmentation_quality = features.get("image_waveform_screen", {}).get("lead_segmentation_quality")
+        image_quality = features.get("image_quality", {})
+        quality_warnings = image_quality.get("warnings", [])
+        preprocessing = features.get("preprocessing", {})
         rate_flag = "unable_to_assess_rate"
         red_flags = []
         if estimated_hr:
@@ -123,6 +132,18 @@ class ECGPipeline:
                 red_flags.append("low_rate_screen_requires_review")
             else:
                 rate_flag = "rate_within_screening_range"
+        confidence = int(
+            max(
+                10,
+                min(
+                    55,
+                    15
+                    + 20 * float(image_quality.get("quality_score", 0) or 0)
+                    + 12 * float(digitization_quality or 0)
+                    + 8 * float(lead_segmentation_quality or 0),
+                ),
+            )
+        )
 
         return {
             "ai_assisted": True,
@@ -186,6 +207,23 @@ class ECGPipeline:
                     f"ECG grid calibration: {calibration.get('status', 'not detected')}."
                 ),
                 (
+                    f"Image quality: {image_quality.get('status', 'unknown')} "
+                    f"(score {image_quality.get('quality_score')})."
+                    if image_quality
+                    else "Image quality could not be calculated."
+                ),
+                (
+                    "Image quality warnings: " + ", ".join(quality_warnings) + "."
+                    if quality_warnings
+                    else "No major image quality warnings were detected by the screening heuristic."
+                ),
+                (
+                    f"Preprocessing applied: contrast normalization, denoising, deskew angle "
+                    f"{preprocessing.get('deskew_angle_degrees', 0)} degrees."
+                    if preprocessing
+                    else "Preprocessing metadata unavailable."
+                ),
+                (
                     f"Lead segmentation quality score: {lead_segmentation_quality}."
                     if lead_segmentation_quality is not None
                     else "Lead segmentation quality could not be calculated."
@@ -200,7 +238,7 @@ class ECGPipeline:
                 "Possible ST elevation screen flag detected - urgent physician review required."
             ] if st_screen.get("possible_st_elevation") else [],
             "differentialDiagnosis": [],
-            "confidence": 25,
+            "confidence": confidence,
             "urgency": "emergent" if st_screen.get("possible_st_elevation") else "urgent" if red_flags else "routine",
             "recommendation": (
                 "Preliminary AI-assisted screening only. Please check this result with a physician/cardiologist. "

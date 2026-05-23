@@ -22,12 +22,14 @@ def test_ecg_image_returns_preliminary_screen(tmp_path):
 
     assert result["diagnostic_status"] == "preliminary_image_screen_requires_review"
     assert result["requires_physician_review"] is True
-    assert result["confidence"] == 25
+    assert 10 <= result["confidence"] <= 55
     assert "estimated_heart_rate_bpm" in result["measurements"]
     assert "rr_regular" in result["measurements"]
     assert "qrs_duration_ms_estimate" in result["measurements"]
     assert "st_screen" in result["measurements"]
     assert "calibration" in result["measurements"]["image_waveform_screen"]
+    assert "image_quality" in result["measurements"]["image_waveform_screen"]
+    assert "preprocessing" in result["measurements"]["image_waveform_screen"]
     assert "lead_segmentation_quality" in result["measurements"]["image_waveform_screen"]
 
 

@@ -195,6 +195,9 @@ function ECGReport({ result }: { result: any }) {
   const urgency = result.urgency || 'routine';
   const uc = urgencyColors[urgency] || '#00e5a0';
   const confidence = result.confidence ?? result.confidence_score ?? 0;
+  const imageQuality = result.measurements?.image_quality || result.measurements?.image_waveform_screen?.image_quality;
+  const preprocessing = result.measurements?.preprocessing || result.measurements?.image_waveform_screen?.preprocessing;
+  const leadQuality = result.measurements?.image_waveform_screen?.lead_segmentation_quality;
 
   return (
     <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
@@ -253,6 +256,34 @@ function ECGReport({ result }: { result: any }) {
             </div>
           )}
         </Section>
+
+        {(imageQuality || preprocessing || leadQuality !== undefined) && (
+          <Section title="Image Quality">
+            <div className="grid grid-cols-2 gap-1.5">
+              {[
+                ['Quality', imageQuality?.status || 'Unknown'],
+                ['Score', imageQuality?.quality_score !== undefined ? `${Math.round(imageQuality.quality_score * 100)}%` : 'Unknown'],
+                ['Grid', imageQuality?.grid_score !== undefined ? `${Math.round(imageQuality.grid_score * 100)}%` : 'Unknown'],
+                ['Lead Split', leadQuality !== undefined ? `${Math.round(leadQuality * 100)}%` : 'Unknown'],
+              ].map(([l, v]) => (
+                <div key={l} className="rounded-lg p-2" style={{ background: 'var(--surface2)', border: '1px solid var(--border)' }}>
+                  <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text3)' }}>{l}</div>
+                  <div style={{ fontFamily: 'DM Mono', color: 'var(--text)' }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            {imageQuality?.warnings?.length > 0 && (
+              <div className="mt-2 p-2 rounded-lg" style={{ background: 'rgba(255,179,71,0.06)', border: '1px solid rgba(255,179,71,0.18)', color: 'var(--text2)' }}>
+                {imageQuality.warnings.join(', ')}
+              </div>
+            )}
+            {preprocessing && (
+              <div className="mt-2 text-[11px]" style={{ color: 'var(--text3)' }}>
+                Deskew {preprocessing.deskew_angle_degrees ?? 0} degrees · processed {preprocessing.processed_shape?.join(' x ') || 'image'}
+              </div>
+            )}
+          </Section>
+        )}
 
         {/* Primary findings */}
         {result.primaryFindings?.length > 0 && (
