@@ -3,7 +3,9 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const API_VERSION = process.env.ANTHROPIC_API_VERSION || "2023-06-01";
 
 const SYSTEM_PROMPT = `You are an ECG clinical decision-support verifier.
@@ -46,10 +48,11 @@ Do not provide definitive diagnosis; require physician validation.`;
 
 export async function POST(req: NextRequest) {
   try {
-    if (!process.env.ANTHROPIC_API_KEY) {
+    const allowAnthropicFallback = process.env.ENABLE_ANTHROPIC_FALLBACK === "true";
+    if (!process.env.GEMINI_API_KEY && (!allowAnthropicFallback || !process.env.ANTHROPIC_API_KEY)) {
       return NextResponse.json({
         enabled: false,
-        error: "ANTHROPIC_API_KEY is not configured for server-side ECG verification.",
+        error: "Gemini visual AI is not configured. Add GEMINI_API_KEY in Vercel.",
       });
     }
 
@@ -67,25 +70,23 @@ export async function POST(req: NextRequest) {
       }, { status: 415 });
     }
 
-    const pass1 = await runAnthropicJson(SYSTEM_PROMPT, [
-      {
-        type: "image",
-        source: { type: "base64", media_type: mediaType, data: imageBase64 },
-      },
-      {
-        type: "text",
-        text: `Perform a conservative ECG screening read. Clinical context: ${clinicalContext || "not provided"}. Return only JSON.`,
-      },
-    ], 1600);
+    const provider = process.env.GEMINI_API_KEY ? "gemini" : "anthropic";
+    const pass1Prompt = `Perform a conservative ECG screening read. Clinical context: ${clinicalContext || "not provided"}. Return only JSON.`;
 
-    const pass2 = await runAnthropicJson(VERIFY_SYSTEM, [
-      {
-        type: "image",
-        source: { type: "base64", media_type: mediaType, data: imageBase64 },
-      },
-      {
-        type: "text",
-        text: `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it and return ONLY JSON:
+    const pass1 = provider === "gemini"
+      ? await runGeminiJson(SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600)
+      : await runAnthropicJson(SYSTEM_PROMPT, [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mediaType, data: imageBase64 },
+          },
+          {
+            type: "text",
+            text: pass1Prompt,
+          },
+        ], 1600);
+
+    const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it and return ONLY JSON:
 {
   "agreement": "full|partial|disagree",
   "verified_findings": [string],
@@ -94,12 +95,24 @@ export async function POST(req: NextRequest) {
   "final_confidence": "high|medium|low",
   "summary": string,
   "requires_physician_review": true
-}`,
-      },
-    ], 900);
+}`;
+
+    const pass2 = provider === "gemini"
+      ? await runGeminiJson(VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900)
+      : await runAnthropicJson(VERIFY_SYSTEM, [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mediaType, data: imageBase64 },
+          },
+          {
+            type: "text",
+            text: pass2Prompt,
+          },
+        ], 900);
 
     return NextResponse.json({
       enabled: true,
+      provider,
       pass1,
       pass2,
       safety: {
@@ -126,7 +139,7 @@ async function runAnthropicJson(system: string, content: any[], maxTokens: numbe
       "anthropic-version": API_VERSION,
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens: maxTokens,
       temperature: 0,
       system,
@@ -150,5 +163,53 @@ async function runAnthropicJson(system: string, content: any[], maxTokens: numbe
     return JSON.parse(text);
   } catch {
     throw new Error("ECG verifier returned non-JSON output");
+  }
+}
+
+async function runGeminiJson(system: string, imageBase64: string, mediaType: string, prompt: string, maxTokens: number) {
+  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: system }],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              inlineData: {
+                mimeType: mediaType,
+                data: imageBase64,
+              },
+            },
+            { text: prompt },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: maxTokens,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || "Gemini ECG verifier request failed");
+  }
+
+  const text = (payload.candidates?.[0]?.content?.parts || [])
+    .map((part: any) => part.text || "")
+    .join("")
+    .replace(/```json|```/g, "")
+    .trim();
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Gemini ECG verifier returned non-JSON output");
   }
 }
