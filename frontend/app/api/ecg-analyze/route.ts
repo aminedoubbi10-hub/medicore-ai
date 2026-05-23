@@ -8,6 +8,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const SYSTEM_PROMPT = `You are an ECG clinical decision-support verifier.
 You are NOT a replacement for a cardiologist and you must not claim definitive diagnosis.
 Use the ECG picture only to produce conservative, structured screening observations.
+The attached image is the clinical input. Do not describe the input as text, truncated text, incomplete text, or incomplete input data.
 If the image is low quality, lead labels are unclear, calibration is absent, or measurements are not visible, return null values and low confidence.
 Never fabricate PR/QRS/QT/QTc, rhythm, axis, or ST measurements.
 Your entire response must be one JSON object. Do not include markdown, code fences, comments, explanations, or text before/after JSON.
@@ -41,8 +42,9 @@ Return ONLY valid JSON with this shape:
 }`;
 
 const VERIFY_SYSTEM = `You are a second independent ECG clinical decision-support verifier.
-Review conservatively, identify disagreements, and return ONLY valid JSON.
+Review the attached ECG picture directly, compare with pass 1, identify disagreements, and return ONLY valid JSON.
 Do not provide definitive diagnosis; require physician validation.
+The attached image is the clinical input. Do not describe the input as text, truncated text, incomplete text, or incomplete input data.
 Your entire response must be one JSON object. Do not include markdown, code fences, comments, explanations, or text before/after JSON.`;
 
 export async function POST(req: NextRequest) {
@@ -73,9 +75,11 @@ Estimate visible heart rate, rhythm regularity, QRS width, visible ST-segment co
 If the picture does not support a measurement, return null or "unable to assess safely".
 Return only JSON.`;
 
-    const pass1 = await runGeminiJson("pass1", SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600);
+    const pass1 = normalizePass1(
+      await runGeminiJson("pass1", SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600)
+    );
 
-    const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it and return ONLY JSON:
+    const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it against the attached ECG picture. Do not rely only on the text above. Return ONLY JSON:
 {
   "agreement": "full|partial|disagree",
   "verified_findings": [string],
@@ -86,7 +90,9 @@ Return only JSON.`;
   "requires_physician_review": true
 }`;
 
-    const pass2 = await runGeminiJson("pass2", VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900);
+    const pass2 = normalizePass2(
+      await runGeminiJson("pass2", VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900)
+    );
 
     return NextResponse.json({
       enabled: true,
@@ -321,6 +327,52 @@ function safePass1FromText(text: string) {
   };
 }
 
+function normalizePass1(value: any) {
+  const normalized = {
+    ...value,
+    interpretation: sanitizeGeminiSummary(String(value?.interpretation || "")),
+    confidence_reason: sanitizeGeminiSummary(String(value?.confidence_reason || "")),
+    recommended_action: sanitizeGeminiSummary(String(value?.recommended_action || "")),
+    safety_note: sanitizeGeminiSummary(String(value?.safety_note || "AI-assisted picture review only. Requires physician validation.")),
+    differential_diagnoses: sanitizeStringArray(value?.differential_diagnoses),
+    critical_findings: sanitizeStringArray(value?.critical_findings),
+  };
+
+  const weakText = [
+    normalized.interpretation,
+    normalized.confidence_reason,
+    normalized.recommended_action,
+  ].join(" ");
+
+  if (isWeakInputTextAnswer(weakText)) {
+    normalized.confidence = "low";
+    normalized.confidence_reason = "Gemini did not provide adequate image-based structured ECG findings. Treat as low confidence and review manually.";
+    normalized.recommended_action = "Review the ECG picture manually and confirm with a physician/cardiologist.";
+    normalized.safety_note = "AI-assisted ECG picture review only. Not a definitive diagnosis.";
+  }
+
+  return normalized;
+}
+
+function normalizePass2(value: any) {
+  const normalized = {
+    ...value,
+    verified_findings: sanitizeStringArray(value?.verified_findings),
+    corrections: sanitizeStringArray(value?.corrections),
+    additional_findings: sanitizeStringArray(value?.additional_findings),
+    summary: sanitizeGeminiSummary(String(value?.summary || "")),
+    requires_physician_review: true,
+  };
+
+  if (isWeakInputTextAnswer(normalized.summary)) {
+    normalized.agreement = "partial";
+    normalized.final_confidence = "low";
+    normalized.summary = "Gemini verification did not provide adequate image-based structured findings. Physician review is required.";
+  }
+
+  return normalized;
+}
+
 function safePass2FromText(text: string) {
   const summary = sanitizeGeminiSummary(compactGeminiText(text));
   return {
@@ -360,9 +412,23 @@ function compactGeminiText(text: string) {
 function sanitizeGeminiSummary(text: string) {
   return text
     .replace(/provided input text/gi, "uploaded ECG picture")
+    .replace(/provided truncated text/gi, "uploaded ECG picture")
+    .replace(/truncated text/gi, "ECG picture")
+    .replace(/incomplete input data/gi, "limited visible ECG picture data")
+    .replace(/incomplete data/gi, "limited visible ECG picture data")
     .replace(/input text was severely truncated/gi, "ECG picture could not be converted into complete structured findings")
     .replace(/text was severely truncated/gi, "ECG picture could not be converted into complete structured findings")
     .trim();
+}
+
+function sanitizeStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").map(sanitizeGeminiSummary)
+    : [];
+}
+
+function isWeakInputTextAnswer(text: string) {
+  return /truncated text|input text|incomplete input data|incomplete data provided|provided input/i.test(text);
 }
 
 const PASS1_SCHEMA = {
