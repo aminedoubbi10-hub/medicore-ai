@@ -5,6 +5,7 @@ import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, Zap, AlertTriangle, CheckCircle, Activity, Circle } from 'lucide-react';
 import { ecgAPI } from '@/lib/api';
+import { applyCardioRules, ECGRuleAlerts } from '@/lib/ecg-rules';
 import { toast } from 'sonner';
 
 type State = 'idle' | 'uploading' | 'processing' | 'complete' | 'error';
@@ -13,14 +14,50 @@ const urgencyColors: Record<string, string> = {
   routine: '#00e5a0', urgent: '#ffb347', emergent: '#ff4d6d',
 };
 
+const LEAD_ORDER = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'];
+
 const STEPS = [
   'Preprocessing ECG image',
   'Detecting lead positions',
   'Rhythm analysis (RR intervals)',
   'ST segment evaluation',
   'QRS morphology analysis',
-  'Generating clinical report',
+  'Running safety rule checks',
+  'Optional visual AI verification',
 ];
+
+function fileToBase64(file: File): Promise<{ base64: string; mediaType: string }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const [header, base64] = result.split(',');
+      resolve({
+        base64,
+        mediaType: header.replace('data:', '').replace(';base64', '') || file.type || 'image/jpeg',
+      });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function runVisualVerifier(file: File, clinicalContext: string) {
+  if (!file.type.startsWith('image/')) {
+    return {
+      enabled: false,
+      error: 'Visual AI verification is image-only right now; backend ECG screening still supports PDFs and waveform files.',
+    };
+  }
+
+  const { base64, mediaType } = await fileToBase64(file);
+  const res = await fetch('/api/ecg-analyze', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageBase64: base64, mediaType, clinicalContext }),
+  });
+  return res.json();
+}
 
 export default function ECGPage() {
   const [file, setFile]         = useState<File | null>(null);
@@ -71,7 +108,31 @@ export default function ECGPage() {
       clearInterval(stepInterval);
       setStep(STEPS.length - 1);
 
-      setResult(res.findings || res);
+      const backendResult = {
+        ...(res.findings || res),
+        study_id: res.study_id,
+        review_status: res.review_status,
+        physician_review: res.physician_review,
+      };
+      const clientRuleAlerts = applyCardioRules(backendResult);
+      let visualVerification: any = null;
+      try {
+        visualVerification = await runVisualVerifier(file, `${patientId} ${clinicalNotes}`.trim());
+      } catch (verificationError: any) {
+        visualVerification = {
+          enabled: false,
+          error: verificationError?.message || 'Visual AI verification unavailable.',
+        };
+      }
+
+      const verifierRuleAlerts = visualVerification?.pass1 ? applyCardioRules(visualVerification.pass1) : null;
+
+      setResult({
+        ...backendResult,
+        clientRuleAlerts,
+        visualVerification,
+        verifierRuleAlerts,
+      });
       setState('complete');
 
       if (res.urgency === 'emergent') {
@@ -195,11 +256,48 @@ function ECGReport({ result }: { result: any }) {
   const urgency = result.urgency || 'routine';
   const uc = urgencyColors[urgency] || '#00e5a0';
   const confidence = result.confidence ?? result.confidence_score ?? 0;
+  const studyId = result.study_id || result.measurements?.study_id;
   const imageQuality = result.measurements?.image_quality || result.measurements?.image_waveform_screen?.image_quality;
   const preprocessing = result.measurements?.preprocessing || result.measurements?.image_waveform_screen?.preprocessing;
   const leadQuality = result.measurements?.image_waveform_screen?.lead_segmentation_quality;
   const aggregate = result.measurements?.image_waveform_screen?.aggregate_measurements;
   const layoutDetection = result.measurements?.image_waveform_screen?.layout_detection;
+  const axisScreen = aggregate?.axis_screen;
+  const progressionScreen = aggregate?.r_wave_progression_screen;
+  const voltageScreen = aggregate?.low_voltage_screen;
+  const irregularityScreen = aggregate?.rhythm_irregularity_screen;
+  const bbbScreen = aggregate?.bundle_branch_block_screen;
+  const stPatternScreen = aggregate?.st_pattern_screen;
+  const [review, setReview] = useState({
+    final_impression: result.physician_review?.final_impression || '',
+    rhythm: result.physician_review?.rhythm || '',
+    intervals: result.physician_review?.intervals || '',
+    st_t_changes: result.physician_review?.st_t_changes || '',
+    reviewer_notes: result.physician_review?.reviewer_notes || '',
+  });
+  const [reviewStatus, setReviewStatus] = useState(result.review_status || 'pending_cardiologist_review');
+  const [savingReview, setSavingReview] = useState(false);
+
+  const submitReview = async () => {
+    if (!studyId) {
+      toast.error('Study ID unavailable for review');
+      return;
+    }
+    if (!review.final_impression.trim()) {
+      toast.error('Final impression is required');
+      return;
+    }
+    setSavingReview(true);
+    try {
+      const saved = await ecgAPI.review(studyId, review);
+      setReviewStatus(saved.review_status || 'reviewed');
+      toast.success('Physician review saved');
+    } catch (err: any) {
+      toast.error(err.message || 'Unable to save review');
+    } finally {
+      setSavingReview(false);
+    }
+  };
 
   return (
     <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
@@ -296,6 +394,37 @@ function ECGReport({ result }: { result: any }) {
           </Section>
         )}
 
+        {(axisScreen || progressionScreen || voltageScreen) && (
+          <Section title="Advanced Screens">
+            <div className="grid grid-cols-1 gap-1.5">
+              {[
+                ['Axis', axisScreen?.status || 'Unavailable'],
+                ['R-Wave Progression', progressionScreen?.status || 'Unavailable'],
+                ['Low Voltage', voltageScreen?.status || 'Unavailable'],
+                ['RR Pattern', irregularityScreen?.status || 'Unavailable'],
+                ['Wide QRS Pattern', bbbScreen?.status || 'Unavailable'],
+                ['ST Pattern', stPatternScreen?.status || 'Unavailable'],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-lg p-2" style={{ background: 'var(--surface2)', border: '1px solid var(--border)' }}>
+                  <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text3)' }}>{label}</div>
+                  <div style={{ fontFamily: 'DM Mono', color: 'var(--text)' }}>{value}</div>
+                </div>
+              ))}
+            </div>
+          </Section>
+        )}
+
+        {result.clientRuleAlerts && (
+          <RuleAlertSection title="Client Safety Rule Engine" alerts={result.clientRuleAlerts} />
+        )}
+
+        {result.visualVerification && (
+          <VisualVerificationSection
+            verification={result.visualVerification}
+            ruleAlerts={result.verifierRuleAlerts}
+          />
+        )}
+
         {/* Primary findings */}
         {result.primaryFindings?.length > 0 && (
           <Section title="Primary Findings">
@@ -344,6 +473,53 @@ function ECGReport({ result }: { result: any }) {
           </Section>
         )}
 
+        <Section title="Physician Review" titleColor="#00e5a0">
+          <div className="space-y-2">
+            <div className="text-[11px]" style={{ color: 'var(--text3)' }}>
+              Status: {reviewStatus}
+            </div>
+            <textarea
+              value={review.final_impression}
+              onChange={(e) => setReview((current) => ({ ...current, final_impression: e.target.value }))}
+              rows={3}
+              placeholder="Final cardiologist impression..."
+              className="w-full rounded-lg px-3 py-2 text-xs outline-none resize-none"
+              style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text)' }}
+            />
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+              {[
+                ['rhythm', 'Rhythm'],
+                ['intervals', 'Intervals'],
+                ['st_t_changes', 'ST-T Changes'],
+              ].map(([key, label]) => (
+                <input
+                  key={key}
+                  value={(review as any)[key]}
+                  onChange={(e) => setReview((current) => ({ ...current, [key]: e.target.value }))}
+                  placeholder={label}
+                  className="rounded-lg px-3 py-2 text-xs outline-none"
+                  style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text)' }}
+                />
+              ))}
+            </div>
+            <textarea
+              value={review.reviewer_notes}
+              onChange={(e) => setReview((current) => ({ ...current, reviewer_notes: e.target.value }))}
+              rows={2}
+              placeholder="Optional reviewer notes..."
+              className="w-full rounded-lg px-3 py-2 text-xs outline-none resize-none"
+              style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text)' }}
+            />
+            <button
+              onClick={submitReview}
+              disabled={savingReview}
+              className="px-3 py-2 rounded-lg text-xs font-semibold disabled:opacity-50"
+              style={{ background: 'linear-gradient(135deg,var(--accent2),#005588)', color: 'white' }}>
+              {savingReview ? 'Saving review...' : 'Save Physician Review'}
+            </button>
+          </div>
+        </Section>
+
         {/* Actions */}
         <div className="flex items-center gap-2 pt-1">
           <span className="px-2.5 py-1 rounded text-[10px] font-bold"
@@ -377,6 +553,111 @@ function Section({ title, titleColor, children }: { title: string; titleColor?: 
       </div>
       {children}
     </div>
+  );
+}
+
+function RuleAlertSection({ title, alerts }: { title: string; alerts: ECGRuleAlerts }) {
+  const rows = [
+    ...alerts.critical.map((text) => ({ text, color: '#ff4d6d', label: 'Critical' })),
+    ...alerts.warning.map((text) => ({ text, color: '#ffb347', label: 'Warning' })),
+    ...alerts.info.map((text) => ({ text, color: '#00e5a0', label: 'Info' })),
+  ];
+
+  if (!rows.length) return null;
+
+  return (
+    <Section title={title} titleColor="#ffb347">
+      <div className="space-y-1.5">
+        {rows.map((row, index) => (
+          <div
+            key={`${row.label}-${index}`}
+            className="p-2 rounded-lg border-l-2"
+            style={{ borderColor: row.color, background: `${row.color}12`, color: 'var(--text2)' }}
+          >
+            <span className="font-bold" style={{ color: row.color }}>{row.label}: </span>
+            {row.text}
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+function VisualVerificationSection({
+  verification,
+  ruleAlerts,
+}: {
+  verification: any;
+  ruleAlerts: ECGRuleAlerts | null;
+}) {
+  if (!verification.enabled) {
+    return (
+      <Section title="Visual AI Verification">
+        <div className="p-2 rounded-lg" style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text3)' }}>
+          {verification.error || 'Visual AI verification unavailable. Backend deterministic screening still completed.'}
+        </div>
+      </Section>
+    );
+  }
+
+  const p = verification.pass1 || {};
+  const pass2 = verification.pass2 || {};
+
+  return (
+    <Section title="Two-Pass Visual AI Verification" titleColor="#00d4ff">
+      <div className="space-y-2">
+        <div className="grid grid-cols-2 gap-1.5">
+          {[
+            ['Rate', p.rate?.ventricular_bpm ? `${Math.round(p.rate.ventricular_bpm)} bpm` : 'Not safely measured'],
+            ['Rhythm', p.rhythm?.classification || 'Uncertain'],
+            ['PR', p.intervals?.PR_ms ? `${Math.round(p.intervals.PR_ms)} ms` : 'Not safely measured'],
+            ['QRS', p.intervals?.QRS_ms ? `${Math.round(p.intervals.QRS_ms)} ms` : 'Not safely measured'],
+            ['QTc', p.intervals?.QTc_ms ? `${Math.round(p.intervals.QTc_ms)} ms` : 'Not safely measured'],
+            ['Quality', p.image_quality || 'Unknown'],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-lg p-2" style={{ background: 'var(--surface2)', border: '1px solid var(--border)' }}>
+              <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text3)' }}>{label}</div>
+              <div style={{ fontFamily: 'DM Mono', color: 'var(--text)' }}>{value}</div>
+            </div>
+          ))}
+        </div>
+
+        {ruleAlerts && <RuleAlertSection title="Verifier Rule Flags" alerts={ruleAlerts} />}
+
+        {p.lead_findings && (
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-1.5">
+            {LEAD_ORDER.map((lead) => (
+              <div key={lead} className="rounded-lg p-2" style={{ background: 'var(--surface2)', border: '1px solid var(--border)' }}>
+                <div className="text-[10px] font-bold mb-0.5" style={{ color: 'var(--accent)' }}>{lead}</div>
+                <div className="leading-snug" style={{ color: 'var(--text2)' }}>{p.lead_findings?.[lead] || 'Not reported'}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="p-2 rounded-lg" style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.15)', color: 'var(--text2)' }}>
+          <div className="font-semibold mb-1">Pass 1 impression</div>
+          <div>{p.interpretation || 'No visual verifier impression returned.'}</div>
+          <div className="mt-1" style={{ color: 'var(--text3)' }}>
+            Confidence: {p.confidence || 'low/unknown'}{p.confidence_reason ? ` - ${p.confidence_reason}` : ''}
+          </div>
+        </div>
+
+        {pass2.summary && (
+          <div className="p-2 rounded-lg" style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text2)' }}>
+            <div className="font-semibold mb-1">Pass 2 verification: {pass2.agreement || 'unknown'}</div>
+            <div>{pass2.summary}</div>
+            {pass2.corrections?.length > 0 && (
+              <div className="mt-1" style={{ color: '#ffb347' }}>Corrections: {pass2.corrections.join('; ')}</div>
+            )}
+          </div>
+        )}
+
+        <div className="text-[11px]" style={{ color: 'var(--text3)' }}>
+          Visual AI verification is an assistant layer only. Final ECG interpretation must be confirmed by a cardiologist.
+        </div>
+      </div>
+    </Section>
   );
 }
 

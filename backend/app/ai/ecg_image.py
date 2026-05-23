@@ -149,7 +149,9 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
     rr_regular = bool(rr_variability is not None and rr_variability < 0.12)
     qrs_ms = _estimate_qrs_ms(signal, peaks, pixels_per_second)
     st_screen = _st_screen(signal, peaks, pixels_per_second)
-    morphology = _lead_morphology(signal, peaks)
+    pixels_per_mv = float(calibration["pixels_per_mv"]) if calibration.get("pixels_per_mv") else None
+    median_beat = _median_beat_features(signal, peaks, pixels_per_second)
+    morphology = _lead_morphology(signal, peaks, trace, pixels_per_mv)
 
     return {
         "image_screen_status": "image_waveform_screen_completed",
@@ -159,6 +161,7 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
         "qrs_duration_ms_estimate": qrs_ms,
         "st_screen": st_screen,
         "qrs_polarity": polarity,
+        "median_beat": median_beat,
         "morphology": morphology,
         "digitization_quality": quality,
         "assumptions": {
@@ -525,6 +528,9 @@ def _aggregate_lead_measurements(lead_screens: dict[str, dict]) -> dict:
             "estimated_heart_rate_bpm": None,
             "rr_regular": None,
             "qrs_duration_ms_estimate": None,
+            "axis_screen": {"status": "unable_to_screen"},
+            "r_wave_progression_screen": {"status": "unable_to_screen"},
+            "low_voltage_screen": {"status": "unable_to_screen"},
             "measurement_consistency": "no_usable_leads",
         }
 
@@ -588,9 +594,92 @@ def _aggregate_lead_measurements(lead_screens: dict[str, dict]) -> dict:
         "rr_regular": rr_regular,
         "rr_regular_source": rr_source,
         "rr_variability_ratio": round(float(np.median(rr_variability_values)), 3) if rr_variability_values else None,
+        "rhythm_irregularity_screen": _rhythm_irregularity_screen(rr_variability_values, rr_regular),
         "qrs_duration_ms_estimate": int(round(float(np.median(qrs_values)))) if qrs_values else None,
         "qrs_duration_range_ms": [min(qrs_values), max(qrs_values)] if qrs_values else None,
+        "bundle_branch_block_screen": _bundle_branch_block_screen(usable, qrs_values),
+        "axis_screen": _axis_screen(usable),
+        "r_wave_progression_screen": _r_wave_progression_screen(usable),
+        "low_voltage_screen": _low_voltage_screen(usable),
+        "st_pattern_screen": _st_pattern_screen(usable),
         "measurement_consistency": consistency,
+    }
+
+
+def _rhythm_irregularity_screen(rr_variability_values: list[float], rr_regular: bool | None) -> dict:
+    if not rr_variability_values:
+        return {"status": "unable_to_screen"}
+    variability = float(np.median(rr_variability_values))
+    if rr_regular is True and variability < 0.08:
+        status = "regular_rr_pattern"
+    elif variability >= 0.2:
+        status = "markedly_irregular_rr_pattern"
+    elif variability >= 0.12:
+        status = "mildly_irregular_rr_pattern"
+    else:
+        status = "borderline_rr_variability"
+    return {
+        "status": status,
+        "median_rr_variability_ratio": round(variability, 3),
+        "method": "image-derived RR interval variability",
+    }
+
+
+def _bundle_branch_block_screen(usable: dict[str, dict], qrs_values: list[int]) -> dict:
+    if not qrs_values:
+        return {"status": "unable_to_screen"}
+    qrs_ms = int(round(float(np.median(qrs_values))))
+    v1 = _lead_net_deflection(usable.get("V1"))
+    v6 = _lead_net_deflection(usable.get("V6"))
+    if qrs_ms < 120:
+        return {"status": "no_wide_qrs_screen_flag", "qrs_ms": qrs_ms}
+    if v1 is None or v6 is None:
+        return {
+            "status": "wide_qrs_untyped",
+            "qrs_ms": qrs_ms,
+            "reason": "V1_or_V6_unavailable",
+        }
+    if v1 > 0 and v6 < 0:
+        status = "possible_rbbb_pattern_screen"
+    elif v1 < 0 and v6 > 0:
+        status = "possible_lbbb_pattern_screen"
+    else:
+        status = "wide_qrs_non_specific_pattern_screen"
+    return {
+        "status": status,
+        "qrs_ms": qrs_ms,
+        "v1_net_deflection": round(float(v1), 3),
+        "v6_net_deflection": round(float(v6), 3),
+        "method": "wide QRS plus image-derived V1/V6 net deflection",
+    }
+
+
+def _st_pattern_screen(usable: dict[str, dict]) -> dict:
+    deltas = {}
+    for lead, screen in usable.items():
+        value = screen.get("st_screen", {}).get("median_st_delta_screen")
+        if value is not None and lead != "rhythm_strip":
+            deltas[lead] = float(value)
+    if not deltas:
+        return {"status": "unable_to_screen"}
+
+    elevated = {lead for lead, value in deltas.items() if value > 0.18}
+    depressed = {lead for lead, value in deltas.items() if value < -0.18}
+    reciprocal_pairs = []
+    if elevated.intersection({"II", "III", "aVF"}) and depressed.intersection({"I", "aVL"}):
+        reciprocal_pairs.append("inferior_elevation_with_lateral_depression")
+    if elevated.intersection({"V1", "V2", "V3", "V4"}) and depressed.intersection({"II", "III", "aVF"}):
+        reciprocal_pairs.append("anterior_elevation_with_inferior_depression")
+    if elevated.intersection({"I", "aVL", "V5", "V6"}) and depressed.intersection({"II", "III", "aVF"}):
+        reciprocal_pairs.append("lateral_elevation_with_inferior_depression")
+
+    return {
+        "status": "reciprocal_st_pattern_screen" if reciprocal_pairs else "no_reciprocal_st_pattern_screen",
+        "elevated_leads": sorted(elevated),
+        "depressed_leads": sorted(depressed),
+        "reciprocal_patterns": reciprocal_pairs,
+        "st_delta_by_lead": {lead: round(value, 3) for lead, value in deltas.items()},
+        "method": "image-derived ST delta pattern comparison",
     }
 
 
@@ -636,7 +725,103 @@ def _detect_qrs_candidates(signal: np.ndarray, width: int) -> tuple[np.ndarray, 
     return np.array([], dtype=int), "undetermined"
 
 
-def _lead_morphology(signal: np.ndarray, peaks: np.ndarray) -> dict:
+def _axis_screen(usable: dict[str, dict]) -> dict:
+    lead_i = _lead_net_deflection(usable.get("I"))
+    avf = _lead_net_deflection(usable.get("aVF"))
+    if lead_i is None or avf is None:
+        return {"status": "unable_to_screen", "reason": "lead_I_or_aVF_unavailable"}
+
+    if lead_i >= 0 and avf >= 0:
+        quadrant = "normal_axis_quadrant"
+        flag = None
+    elif lead_i >= 0 and avf < 0:
+        quadrant = "possible_left_axis_deviation_quadrant"
+        flag = "possible_left_axis_deviation_screen"
+    elif lead_i < 0 and avf >= 0:
+        quadrant = "possible_right_axis_deviation_quadrant"
+        flag = "possible_right_axis_deviation_screen"
+    else:
+        quadrant = "extreme_axis_quadrant"
+        flag = "possible_extreme_axis_screen"
+
+    return {
+        "status": quadrant,
+        "lead_i_net_deflection": round(float(lead_i), 3),
+        "avf_net_deflection": round(float(avf), 3),
+        "flag": flag,
+        "method": "image-derived net QRS deflection in I and aVF",
+    }
+
+
+def _r_wave_progression_screen(usable: dict[str, dict]) -> dict:
+    values = []
+    for lead in ["V1", "V2", "V3", "V4", "V5", "V6"]:
+        amplitude = _lead_r_amplitude(usable.get(lead))
+        if amplitude is not None:
+            values.append((lead, amplitude))
+    if len(values) < 4:
+        return {"status": "unable_to_screen", "reason": "insufficient_precordial_leads", "values": values}
+
+    lead_to_amp = dict(values)
+    early = max(lead_to_amp.get("V1", 0), lead_to_amp.get("V2", 0))
+    late = max(lead_to_amp.get("V5", 0), lead_to_amp.get("V6", 0))
+    v3_v4 = max(lead_to_amp.get("V3", 0), lead_to_amp.get("V4", 0))
+    poor = late <= early * 1.15 and v3_v4 <= early * 1.2
+    return {
+        "status": "possible_poor_r_wave_progression" if poor else "no_poor_r_wave_progression_screen_flag",
+        "possible_poor_r_wave_progression": bool(poor),
+        "r_amplitude_by_lead": {lead: round(float(value), 3) for lead, value in values},
+        "method": "relative image-derived R amplitude trend V1-V6",
+    }
+
+
+def _low_voltage_screen(usable: dict[str, dict]) -> dict:
+    limb = ["I", "II", "III", "aVR", "aVL", "aVF"]
+    precordial = ["V1", "V2", "V3", "V4", "V5", "V6"]
+    limb_values = [_lead_qrs_amplitude_mv(usable.get(lead)) for lead in limb]
+    precordial_values = [_lead_qrs_amplitude_mv(usable.get(lead)) for lead in precordial]
+    limb_values = [value for value in limb_values if value is not None]
+    precordial_values = [value for value in precordial_values if value is not None]
+    if len(limb_values) < 4 and len(precordial_values) < 4:
+        return {"status": "unable_to_screen", "reason": "calibrated_amplitudes_unavailable"}
+
+    limb_low = len(limb_values) >= 4 and max(limb_values) < 0.5
+    precordial_low = len(precordial_values) >= 4 and max(precordial_values) < 1.0
+    possible = limb_low or precordial_low
+    return {
+        "status": "possible_low_voltage" if possible else "no_low_voltage_screen_flag",
+        "possible_low_voltage": bool(possible),
+        "max_limb_qrs_mv": round(max(limb_values), 3) if limb_values else None,
+        "max_precordial_qrs_mv": round(max(precordial_values), 3) if precordial_values else None,
+        "method": "image-derived amplitude with detected grid calibration",
+    }
+
+
+def _lead_net_deflection(screen: dict | None) -> float | None:
+    if not screen:
+        return None
+    morphology = screen.get("morphology") or {}
+    value = morphology.get("median_qrs_amplitude")
+    return float(value) if value is not None else None
+
+
+def _lead_r_amplitude(screen: dict | None) -> float | None:
+    if not screen:
+        return None
+    morphology = screen.get("morphology") or {}
+    value = morphology.get("median_positive_qrs_amplitude")
+    return float(value) if value is not None else None
+
+
+def _lead_qrs_amplitude_mv(screen: dict | None) -> float | None:
+    if not screen:
+        return None
+    morphology = screen.get("morphology") or {}
+    value = morphology.get("qrs_peak_to_peak_mv")
+    return float(value) if value is not None else None
+
+
+def _lead_morphology(signal: np.ndarray, peaks: np.ndarray, raw_trace: np.ndarray, pixels_per_mv: float | None) -> dict:
     if len(peaks) == 0:
         return {
             "net_qrs_deflection": None,
@@ -645,6 +830,8 @@ def _lead_morphology(signal: np.ndarray, peaks: np.ndarray) -> dict:
         }
 
     amplitudes = []
+    positive_amplitudes = []
+    peak_to_peak_pixels = []
     local_baselines = []
     for peak in peaks[:12]:
         left = max(0, peak - 20)
@@ -656,6 +843,10 @@ def _lead_morphology(signal: np.ndarray, peaks: np.ndarray) -> dict:
         if len(local) and len(baseline_region):
             baseline = float(np.median(baseline_region))
             amplitudes.append(float(signal[peak] - baseline))
+            positive_amplitudes.append(float(max(0, np.max(local) - baseline)))
+            raw_local = raw_trace[left:right]
+            if len(raw_local):
+                peak_to_peak_pixels.append(float(np.percentile(raw_local, 95) - np.percentile(raw_local, 5)))
             local_baselines.append(baseline)
 
     if not amplitudes:
@@ -674,10 +865,55 @@ def _lead_morphology(signal: np.ndarray, peaks: np.ndarray) -> dict:
         net = "isoelectric_or_low_amplitude"
 
     wander = float(np.std(local_baselines)) if local_baselines else None
+    qrs_ptp_px = float(np.median(peak_to_peak_pixels)) if peak_to_peak_pixels else None
+    qrs_ptp_mv = (qrs_ptp_px / pixels_per_mv) if qrs_ptp_px is not None and pixels_per_mv else None
     return {
         "net_qrs_deflection": net,
         "median_qrs_amplitude": round(median_amp, 3),
+        "median_positive_qrs_amplitude": round(float(np.median(positive_amplitudes)), 3) if positive_amplitudes else None,
+        "qrs_peak_to_peak_px": round(qrs_ptp_px, 3) if qrs_ptp_px is not None else None,
+        "qrs_peak_to_peak_mv": round(qrs_ptp_mv, 3) if qrs_ptp_mv is not None else None,
         "baseline_wander_score": round(wander, 3) if wander is not None else None,
+    }
+
+
+def _median_beat_features(signal: np.ndarray, peaks: np.ndarray, pixels_per_second: float) -> dict:
+    pre = int(0.24 * pixels_per_second)
+    post = int(0.44 * pixels_per_second)
+    beats = []
+    for peak in peaks[:16]:
+        start = peak - pre
+        end = peak + post
+        if start >= 0 and end <= len(signal):
+            beats.append(signal[start:end])
+    if len(beats) < 2:
+        return {"status": "insufficient_beats"}
+
+    beat_matrix = np.vstack(beats)
+    median = np.median(beat_matrix, axis=0)
+    qrs_center = pre
+    baseline_start = max(0, qrs_center - int(0.2 * pixels_per_second))
+    baseline_end = max(1, qrs_center - int(0.12 * pixels_per_second))
+    baseline = float(np.median(median[baseline_start:baseline_end]))
+
+    p_window = median[max(0, qrs_center - int(0.22 * pixels_per_second)):max(1, qrs_center - int(0.08 * pixels_per_second))]
+    t_window = median[
+        min(len(median), qrs_center + int(0.12 * pixels_per_second)):
+        min(len(median), qrs_center + int(0.4 * pixels_per_second))
+    ]
+    p_amp = float(np.max(p_window) - baseline) if len(p_window) else None
+    t_amp = float(np.max(t_window) - baseline) if len(t_window) else None
+    t_inversion = bool(t_amp is not None and abs(float(np.min(t_window) - baseline)) > max(0.12, (t_amp or 0) * 1.2)) if len(t_window) else None
+
+    return {
+        "status": "median_beat_computed",
+        "beat_count": len(beats),
+        "p_wave_visible_screen": bool(p_amp is not None and p_amp > 0.08),
+        "t_wave_visible_screen": bool(t_amp is not None and abs(t_amp) > 0.08),
+        "possible_t_wave_inversion_screen": t_inversion,
+        "median_p_amplitude": round(p_amp, 3) if p_amp is not None else None,
+        "median_t_amplitude": round(t_amp, 3) if t_amp is not None else None,
+        "method": "median beat from image-derived QRS candidates",
     }
 
 

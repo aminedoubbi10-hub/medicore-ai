@@ -9,6 +9,7 @@ from __future__ import annotations
 def build_ecg_screen_interpretation(features: dict) -> dict:
     image_screen = features.get("image_waveform_screen", {}) or {}
     image_quality = features.get("image_quality", {}) or {}
+    aggregate = image_screen.get("aggregate_measurements", {}) or {}
     st_screen = features.get("st_screen", {}) or {}
     estimated_hr = features.get("estimated_heart_rate_bpm")
     rr_regular = features.get("rr_regular")
@@ -51,6 +52,21 @@ def build_ecg_screen_interpretation(features: dict) -> dict:
     red_flags.extend(quality_flags)
     limitations.extend(quality_limitations)
 
+    consistency_findings, consistency_flags, consistency_limitations = _consistency_screen(aggregate)
+    primary_findings.extend(consistency_findings)
+    red_flags.extend(consistency_flags)
+    limitations.extend(consistency_limitations)
+
+    advanced_findings, advanced_flags, advanced_limitations = _advanced_lead_screens(aggregate)
+    primary_findings.extend(advanced_findings)
+    red_flags.extend(advanced_flags)
+    limitations.extend(advanced_limitations)
+
+    morphology_findings, morphology_flags, morphology_limitations = _morphology_screens(aggregate)
+    primary_findings.extend(morphology_findings)
+    red_flags.extend(morphology_flags)
+    limitations.extend(morphology_limitations)
+
     if not primary_findings:
         primary_findings.append("No reliable ECG image-derived interpretation could be generated from available measurements.")
 
@@ -72,6 +88,7 @@ def build_ecg_screen_interpretation(features: dict) -> dict:
         "rhythm": rhythm_text,
         "heartRate": rate_text,
         "qrsDuration": qrs_text,
+        "axis": _axis_text(aggregate.get("axis_screen", {})),
         "stChanges": st_text,
         "primaryFindings": _dedupe(primary_findings),
         "criticalFindings": _dedupe(critical_findings),
@@ -86,6 +103,7 @@ def build_ecg_screen_interpretation(features: dict) -> dict:
                 "rr_regular": rr_regular,
                 "qrs_duration_ms_estimate": qrs_ms,
                 "st_screen": st_screen,
+                "aggregate_measurements": aggregate,
                 "image_quality_score": image_quality_score,
                 "digitization_quality": digitization_quality,
                 "lead_segmentation_quality": lead_quality,
@@ -205,6 +223,21 @@ def _st_screen(st_screen: dict) -> tuple[str, list[str], list[str], list[str], s
             "emergent",
         )
 
+    depression_leads = st_screen.get("possible_st_depression_leads") or []
+    if depression_leads:
+        lead_text = ", ".join(depression_leads)
+        finding = (
+            f"Possible ST depression screen flag in {lead_text}; correlate with symptoms, serial ECGs, "
+            "troponin, and physician review."
+        )
+        return (
+            "Possible ST depression screen flag - review required",
+            [finding],
+            [],
+            ["possible_st_depression_screen"],
+            "urgent",
+        )
+
     return (
         "No ST elevation screen flag by image heuristic",
         ["No possible ST elevation screen flag was detected by the image heuristic."],
@@ -239,6 +272,111 @@ def _quality_screen(image_quality: dict, digitization_quality: float, lead_quali
         limitations.append("Low lead segmentation quality limits multi-lead territory interpretation.")
 
     return findings, flags, limitations
+
+
+def _consistency_screen(aggregate: dict) -> tuple[list[str], list[str], list[str]]:
+    if not aggregate:
+        return [], ["aggregate_measurements_unavailable"], ["Aggregate multi-lead measurements were unavailable."]
+
+    findings = []
+    flags = []
+    limitations = []
+    usable_count = int(aggregate.get("usable_lead_count") or 0)
+    consistency = aggregate.get("measurement_consistency", "unknown")
+
+    findings.append(f"Usable digitized lead count: {usable_count}.")
+    findings.append(f"Cross-lead measurement consistency: {consistency}.")
+
+    if aggregate.get("heart_rate_range_bpm"):
+        lo, hi = aggregate["heart_rate_range_bpm"]
+        findings.append(f"Heart-rate estimates across usable leads ranged from {lo} to {hi} bpm.")
+
+    if aggregate.get("qrs_duration_range_ms"):
+        lo, hi = aggregate["qrs_duration_range_ms"]
+        findings.append(f"QRS estimates across usable leads ranged from {lo} to {hi} ms.")
+
+    if usable_count < 4:
+        flags.append("limited_usable_leads")
+        limitations.append("Few usable leads were digitized; multi-lead interpretation is limited.")
+    if consistency == "low_consistency_between_leads":
+        flags.append("low_cross_lead_measurement_consistency")
+        limitations.append("Cross-lead measurement inconsistency reduces reliability of rate/QRS/ST estimates.")
+
+    return findings, flags, limitations
+
+
+def _advanced_lead_screens(aggregate: dict) -> tuple[list[str], list[str], list[str]]:
+    findings = []
+    flags = []
+    limitations = []
+
+    axis = aggregate.get("axis_screen") or {}
+    if axis.get("status") and axis["status"] != "unable_to_screen":
+        findings.append(f"Axis quadrant screen: {axis['status']}.")
+        if axis.get("flag"):
+            flags.append(axis["flag"])
+    else:
+        limitations.append("Axis quadrant screen unavailable because required limb leads were not reliably extracted.")
+
+    progression = aggregate.get("r_wave_progression_screen") or {}
+    if progression.get("status") and progression["status"] != "unable_to_screen":
+        findings.append(f"R-wave progression screen: {progression['status']}.")
+        if progression.get("possible_poor_r_wave_progression"):
+            flags.append("possible_poor_r_wave_progression_screen")
+    else:
+        limitations.append("R-wave progression screen unavailable because precordial leads were insufficient.")
+
+    voltage = aggregate.get("low_voltage_screen") or {}
+    if voltage.get("status") and voltage["status"] != "unable_to_screen":
+        findings.append(f"Low-voltage screen: {voltage['status']}.")
+        if voltage.get("possible_low_voltage"):
+            flags.append("possible_low_voltage_screen")
+    else:
+        limitations.append("Low-voltage screen unavailable without reliable calibrated QRS amplitudes.")
+
+    return findings, flags, limitations
+
+
+def _morphology_screens(aggregate: dict) -> tuple[list[str], list[str], list[str]]:
+    findings = []
+    flags = []
+    limitations = []
+
+    rhythm = aggregate.get("rhythm_irregularity_screen") or {}
+    if rhythm.get("status") and rhythm["status"] != "unable_to_screen":
+        findings.append(f"RR irregularity screen: {rhythm['status']}.")
+        if rhythm["status"] in {"markedly_irregular_rr_pattern", "mildly_irregular_rr_pattern"}:
+            flags.append(rhythm["status"])
+    else:
+        limitations.append("RR irregularity category unavailable.")
+
+    bundle = aggregate.get("bundle_branch_block_screen") or {}
+    if bundle.get("status") and bundle["status"] not in {"unable_to_screen", "no_wide_qrs_screen_flag"}:
+        findings.append(f"Wide-QRS pattern screen: {bundle['status']}.")
+        flags.append(bundle["status"])
+
+    st_pattern = aggregate.get("st_pattern_screen") or {}
+    if st_pattern.get("status") == "reciprocal_st_pattern_screen":
+        patterns = ", ".join(st_pattern.get("reciprocal_patterns") or [])
+        findings.append(f"Reciprocal ST pattern screen: {patterns}.")
+        flags.append("reciprocal_st_pattern_screen")
+    elif st_pattern.get("status") == "unable_to_screen":
+        limitations.append("Reciprocal ST pattern screen unavailable.")
+
+    return findings, flags, limitations
+
+
+def _axis_text(axis_screen: dict) -> str:
+    status = axis_screen.get("status")
+    if not status or status == "unable_to_screen":
+        return "Unable to determine safely from image"
+    labels = {
+        "normal_axis_quadrant": "Normal axis quadrant by image screen",
+        "possible_left_axis_deviation_quadrant": "Possible left axis deviation by image screen",
+        "possible_right_axis_deviation_quadrant": "Possible right axis deviation by image screen",
+        "extreme_axis_quadrant": "Possible extreme axis by image screen",
+    }
+    return labels.get(status, status)
 
 
 def _confidence_score(

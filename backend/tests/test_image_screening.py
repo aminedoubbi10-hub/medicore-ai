@@ -35,6 +35,13 @@ def test_ecg_image_returns_preliminary_screen(tmp_path):
     assert "rule_engine" in result["measurements"]
     assert "lead_segmentation_quality" in result["measurements"]["image_waveform_screen"]
     assert "usable_lead_count" in result["measurements"]["image_waveform_screen"]["aggregate_measurements"]
+    aggregate = result["measurements"]["image_waveform_screen"]["aggregate_measurements"]
+    assert "axis_screen" in aggregate
+    assert "r_wave_progression_screen" in aggregate
+    assert "low_voltage_screen" in aggregate
+    assert "rhythm_irregularity_screen" in aggregate
+    assert "bundle_branch_block_screen" in aggregate
+    assert "st_pattern_screen" in aggregate
 
 
 def test_xray_image_returns_local_review_screen(tmp_path):

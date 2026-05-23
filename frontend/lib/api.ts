@@ -62,6 +62,7 @@ export const ecgAPI = {
   upload: (form: FormData) =>
     api.post('/ecg/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((r) => r.data),
   getResult: (id: string) => api.get(`/ecg/${id}/result`).then((r) => r.data),
+  review: (id: string, data: any) => api.post(`/ecg/${id}/review`, data).then((r) => r.data),
   pollResult: async (id: string, max = 30): Promise<any> => {
     for (let i = 0; i < max; i++) {
       const r = await ecgAPI.getResult(id);

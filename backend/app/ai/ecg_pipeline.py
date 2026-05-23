@@ -149,7 +149,7 @@ class ECGPipeline:
             "qrsDuration": rule_result.get("qrsDuration") or "Unable to measure safely from image",
             "qtInterval": "Unable to measure safely from image",
             "stChanges": rule_result.get("stChanges") or "Unable to assess ST changes safely from image",
-            "axis": "Unable to determine safely from image",
+            "axis": rule_result.get("axis") or "Unable to determine safely from image",
             "measurements": {
                 **features,
                 "rate_screen": rate_flag,
