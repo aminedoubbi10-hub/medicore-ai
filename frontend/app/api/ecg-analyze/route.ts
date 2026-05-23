@@ -2,17 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const API_VERSION = process.env.ANTHROPIC_API_VERSION || "2023-06-01";
 
 const SYSTEM_PROMPT = `You are an ECG clinical decision-support verifier.
 You are NOT a replacement for a cardiologist and you must not claim definitive diagnosis.
-Use the ECG image only to produce conservative, structured screening observations.
+Use the ECG picture only to produce conservative, structured screening observations.
 If the image is low quality, lead labels are unclear, calibration is absent, or measurements are not visible, return null values and low confidence.
 Never fabricate PR/QRS/QT/QTc, rhythm, axis, or ST measurements.
+Your entire response must be one JSON object. Do not include markdown, code fences, comments, explanations, or text before/after JSON.
 Return ONLY valid JSON with this shape:
 {
   "rate": { "ventricular_bpm": number_or_null, "atrial_bpm": number_or_null },
@@ -44,12 +42,12 @@ Return ONLY valid JSON with this shape:
 
 const VERIFY_SYSTEM = `You are a second independent ECG clinical decision-support verifier.
 Review conservatively, identify disagreements, and return ONLY valid JSON.
-Do not provide definitive diagnosis; require physician validation.`;
+Do not provide definitive diagnosis; require physician validation.
+Your entire response must be one JSON object. Do not include markdown, code fences, comments, explanations, or text before/after JSON.`;
 
 export async function POST(req: NextRequest) {
   try {
-    const allowAnthropicFallback = process.env.ENABLE_ANTHROPIC_FALLBACK === "true";
-    if (!process.env.GEMINI_API_KEY && (!allowAnthropicFallback || !process.env.ANTHROPIC_API_KEY)) {
+    if (!process.env.GEMINI_API_KEY) {
       return NextResponse.json({
         enabled: false,
         error: "Gemini visual AI is not configured. Add GEMINI_API_KEY in Vercel.",
@@ -64,27 +62,18 @@ export async function POST(req: NextRequest) {
     if (!imageBase64) {
       return NextResponse.json({ error: "imageBase64 is required" }, { status: 400 });
     }
-    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(mediaType)) {
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"].includes(mediaType)) {
       return NextResponse.json({
-        error: "Server-side visual verification currently supports JPG, PNG, WEBP, or GIF ECG images. PDFs still use the backend pipeline.",
+        error: "Gemini visual verification supports ECG pictures only: JPG, PNG, WEBP, GIF, HEIC, or HEIF. PDFs still use the backend pipeline.",
       }, { status: 415 });
     }
 
-    const provider = process.env.GEMINI_API_KEY ? "gemini" : "anthropic";
-    const pass1Prompt = `Perform a conservative ECG screening read. Clinical context: ${clinicalContext || "not provided"}. Return only JSON.`;
+    const pass1Prompt = `Perform a conservative ECG screening read from this ECG picture. Clinical context: ${clinicalContext || "not provided"}.
+Estimate visible heart rate, rhythm regularity, QRS width, visible ST-segment concerns, lead-by-lead observations, and image quality only when the picture supports it.
+If the picture does not support a measurement, return null or "unable to assess safely".
+Return only JSON.`;
 
-    const pass1 = provider === "gemini"
-      ? await runGeminiJson(SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600)
-      : await runAnthropicJson(SYSTEM_PROMPT, [
-          {
-            type: "image",
-            source: { type: "base64", media_type: mediaType, data: imageBase64 },
-          },
-          {
-            type: "text",
-            text: pass1Prompt,
-          },
-        ], 1600);
+    const pass1 = await runGeminiJson(SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600);
 
     const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it and return ONLY JSON:
 {
@@ -97,22 +86,12 @@ export async function POST(req: NextRequest) {
   "requires_physician_review": true
 }`;
 
-    const pass2 = provider === "gemini"
-      ? await runGeminiJson(VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900)
-      : await runAnthropicJson(VERIFY_SYSTEM, [
-          {
-            type: "image",
-            source: { type: "base64", media_type: mediaType, data: imageBase64 },
-          },
-          {
-            type: "text",
-            text: pass2Prompt,
-          },
-        ], 900);
+    const pass2 = await runGeminiJson(VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900);
 
     return NextResponse.json({
       enabled: true,
-      provider,
+      provider: "gemini",
+      model: GEMINI_MODEL,
       pass1,
       pass2,
       safety: {
@@ -127,42 +106,6 @@ export async function POST(req: NextRequest) {
       enabled: false,
       error: err?.message || "ECG visual verification failed safely.",
     }, { status: 200 });
-  }
-}
-
-async function runAnthropicJson(system: string, content: any[], maxTokens: number) {
-  const response = await fetch(ANTHROPIC_API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY || "",
-      "anthropic-version": API_VERSION,
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: maxTokens,
-      temperature: 0,
-      system,
-      messages: [{ role: "user", content }],
-    }),
-  });
-
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload?.error?.message || "Anthropic ECG verifier request failed");
-  }
-
-  const text = (payload.content || [])
-    .filter((block: any) => block.type === "text")
-    .map((block: any) => block.text)
-    .join("")
-    .replace(/```json|```/g, "")
-    .trim();
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("ECG verifier returned non-JSON output");
   }
 }
 
@@ -208,8 +151,62 @@ async function runGeminiJson(system: string, imageBase64: string, mediaType: str
     .trim();
 
   try {
-    return JSON.parse(text);
+    return parseJsonPayload(text);
   } catch {
     throw new Error("Gemini ECG verifier returned non-JSON output");
   }
+}
+
+function parseJsonPayload(text: string) {
+  const cleaned = text
+    .replace(/```json|```/g, "")
+    .replace(/^\s*JSON\s*:/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const objectText = extractFirstJsonObject(cleaned);
+    if (!objectText) throw new Error("No JSON object found");
+    return JSON.parse(objectText);
+  }
+}
+
+function extractFirstJsonObject(text: string) {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+
+    if (depth === 0) {
+      return text.slice(start, index + 1);
+    }
+  }
+
+  return null;
 }

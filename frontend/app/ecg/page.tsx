@@ -23,7 +23,7 @@ const STEPS = [
   'ST segment evaluation',
   'QRS morphology analysis',
   'Running safety rule checks',
-  'Optional visual AI verification',
+  'Gemini ECG picture verification',
 ];
 
 function fileToBase64(file: File): Promise<{ base64: string; mediaType: string }> {
@@ -46,7 +46,7 @@ async function runVisualVerifier(file: File, clinicalContext: string) {
   if (!file.type.startsWith('image/')) {
     return {
       enabled: false,
-      error: 'Visual AI verification is image-only right now; backend ECG screening still supports PDFs and waveform files.',
+      error: 'Gemini ECG verification is picture-only right now; backend ECG screening still supports PDFs and waveform files.',
     };
   }
 
@@ -121,7 +121,7 @@ export default function ECGPage() {
       } catch (verificationError: any) {
         visualVerification = {
           enabled: false,
-          error: verificationError?.message || 'Visual AI verification unavailable.',
+          error: verificationError?.message || 'Gemini ECG picture verification unavailable.',
         };
       }
 
@@ -174,9 +174,9 @@ export default function ECGPage() {
               <input {...getInputProps()} />
               <Upload className="w-10 h-10 mx-auto mb-3" style={{ color: file ? '#00e5a0' : 'var(--text3)' }} />
               <p className="text-sm font-medium mb-1">{file ? `✓ ${file.name}` : 'Drop ECG file or click to browse'}</p>
-              <p className="text-xs mb-3" style={{ color: 'var(--text3)' }}>PNG, JPG, PDF · Max 100 MB</p>
+              <p className="text-xs mb-3" style={{ color: 'var(--text3)' }}>PNG, JPG, WEBP, HEIC, PDF · Max 100 MB</p>
               <div className="flex gap-1.5 justify-center flex-wrap">
-                {['PNG/JPG', 'PDF', 'CSV', 'TXT', 'XML'].map((f) => (
+                {['Pictures', 'PDF', 'CSV', 'TXT', 'XML'].map((f) => (
                   <span key={f} className="text-[10px] px-2 py-0.5 rounded"
                     style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text3)' }}>{f}</span>
                 ))}
@@ -242,7 +242,7 @@ export default function ECGPage() {
               <div className="text-center" style={{ color: 'var(--text3)' }}>
                 <Activity className="w-12 h-12 mx-auto mb-3 opacity-30" />
                 <p className="text-sm">Upload an ECG and click Analyze</p>
-                <p className="text-xs mt-1">Image quality, rhythm, QRS and ST screening</p>
+                <p className="text-xs mt-1">Backend screen plus Gemini verification for ECG pictures</p>
               </div>
             </div>
           )}
@@ -592,9 +592,9 @@ function VisualVerificationSection({
 }) {
   if (!verification.enabled) {
     return (
-      <Section title="Visual AI Verification">
+      <Section title="Gemini ECG Picture Verification">
         <div className="p-2 rounded-lg" style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text3)' }}>
-          {verification.error || 'Visual AI verification unavailable. Backend deterministic screening still completed.'}
+          {verification.error || 'Gemini verification unavailable. Backend deterministic screening still completed.'}
         </div>
       </Section>
     );
@@ -604,8 +604,11 @@ function VisualVerificationSection({
   const pass2 = verification.pass2 || {};
 
   return (
-    <Section title="Two-Pass Visual AI Verification" titleColor="#00d4ff">
+    <Section title="Gemini Two-Pass ECG Picture Verification" titleColor="#00d4ff">
       <div className="space-y-2">
+        <div className="text-[11px]" style={{ color: 'var(--text3)' }}>
+          Provider: Gemini{verification.model ? ` (${verification.model})` : ''}. This verifies ECG pictures only; PDFs continue through the backend pipeline.
+        </div>
         <div className="grid grid-cols-2 gap-1.5">
           {[
             ['Rate', p.rate?.ventricular_bpm ? `${Math.round(p.rate.ventricular_bpm)} bpm` : 'Not safely measured'],
@@ -654,7 +657,7 @@ function VisualVerificationSection({
         )}
 
         <div className="text-[11px]" style={{ color: 'var(--text3)' }}>
-          Visual AI verification is an assistant layer only. Final ECG interpretation must be confirmed by a cardiologist.
+          Gemini verification is an assistant layer only. Final ECG interpretation must be confirmed by a cardiologist.
         </div>
       </div>
     </Section>
