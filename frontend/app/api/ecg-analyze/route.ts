@@ -161,9 +161,78 @@ async function runGeminiJson(
   try {
     return parseJsonPayload(text);
   } catch {
+    const imageRetry = await retryGeminiImageJson(mode, system, imageBase64, mediaType, prompt, maxTokens);
+    if (imageRetry) return imageRetry;
     const repaired = await repairGeminiJson(mode, text);
     if (repaired) return repaired;
     return mode === "pass1" ? safePass1FromText(text) : safePass2FromText(text);
+  }
+}
+
+async function retryGeminiImageJson(
+  mode: "pass1" | "pass2",
+  system: string,
+  imageBase64: string,
+  mediaType: string,
+  originalPrompt: string,
+  maxTokens: number
+) {
+  const retryPrompt = mode === "pass1"
+    ? `Re-read the attached ECG picture directly. The previous response was not usable.
+Return a complete JSON object only. Do not say the input text is incomplete because the image is the source.
+Use null or "unable to assess safely" for any measurement not visible in the ECG picture.
+
+Required task:
+${originalPrompt}`
+    : `Re-read the attached ECG picture directly and verify the first pass. The previous response was not usable.
+Return a complete JSON object only. Do not mention truncated input text.
+
+Required task:
+${originalPrompt}`;
+
+  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: system }],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              inlineData: {
+                mimeType: mediaType,
+                data: imageBase64,
+              },
+            },
+            { text: retryPrompt },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: maxTokens,
+        responseMimeType: "application/json",
+        responseSchema: mode === "pass1" ? PASS1_SCHEMA : PASS2_SCHEMA,
+      },
+    }),
+  });
+
+  if (!response.ok) return null;
+
+  const payload = await response.json();
+  const text = (payload.candidates?.[0]?.content?.parts || [])
+    .map((part: any) => part.text || "")
+    .join("")
+    .replace(/```json|```/g, "")
+    .trim();
+
+  try {
+    return parseJsonPayload(text);
+  } catch {
+    return null;
   }
 }
 
@@ -217,7 +286,7 @@ async function repairGeminiJson(mode: "pass1" | "pass2", rawText: string) {
 }
 
 function safePass1FromText(text: string) {
-  const summary = compactGeminiText(text);
+  const summary = sanitizeGeminiSummary(compactGeminiText(text));
   return {
     rate: { ventricular_bpm: null, atrial_bpm: null },
     rhythm: {
@@ -253,7 +322,7 @@ function safePass1FromText(text: string) {
 }
 
 function safePass2FromText(text: string) {
-  const summary = compactGeminiText(text);
+  const summary = sanitizeGeminiSummary(compactGeminiText(text));
   return {
     agreement: "partial",
     verified_findings: [],
@@ -286,6 +355,14 @@ function emptyLeadFindings(value: string) {
 
 function compactGeminiText(text: string) {
   return text.replace(/\s+/g, " ").trim().slice(0, 1200);
+}
+
+function sanitizeGeminiSummary(text: string) {
+  return text
+    .replace(/provided input text/gi, "uploaded ECG picture")
+    .replace(/input text was severely truncated/gi, "ECG picture could not be converted into complete structured findings")
+    .replace(/text was severely truncated/gi, "ECG picture could not be converted into complete structured findings")
+    .trim();
 }
 
 const PASS1_SCHEMA = {
