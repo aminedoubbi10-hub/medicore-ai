@@ -14,6 +14,8 @@ LEAD_LAYOUT = [
     ["III", "aVF", "V3", "V6"],
 ]
 
+LEAD_ORDER = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+
 TERRITORIES = {
     "inferior": {"II", "III", "aVF"},
     "lateral": {"I", "aVL", "V5", "V6"},
@@ -51,7 +53,7 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
     working_image = prepared["image"]
     quality_assessment = _assess_image_quality(working_image, prepared)
     calibration = _detect_grid_calibration(working_image)
-    lead_regions = _segment_leads(working_image)
+    lead_regions, layout_detection = _detect_best_lead_layout(working_image, calibration)
     lead_screens = {}
     for lead_name, crop in lead_regions.items():
         lead_screens[lead_name] = _screen_single_trace(crop, calibration)
@@ -64,6 +66,7 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
     representative_lead = "II" if "II" in usable else next(iter(usable), None)
     representative = usable.get(representative_lead) if representative_lead else None
     st_summary = _territory_st_summary(lead_screens)
+    aggregate = _aggregate_lead_measurements(lead_screens)
 
     if not representative:
         return {
@@ -74,21 +77,29 @@ def screen_ecg_image(image_gray: np.ndarray) -> dict:
             "st_screen": {"status": "unable_to_screen", "possible_st_elevation": False},
             "digitization_quality": 0.0,
             "lead_screens": lead_screens,
-            "lead_layout": "attempted_3x4_standard_layout",
+            "lead_layout": layout_detection["selected_layout"],
+            "layout_detection": layout_detection,
             "calibration": calibration,
             "image_quality": quality_assessment,
             "preprocessing": prepared["metadata"],
+            "aggregate_measurements": aggregate,
             "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         }
 
     return {
         **representative,
+        "estimated_heart_rate_bpm": aggregate.get("estimated_heart_rate_bpm") or representative.get("estimated_heart_rate_bpm"),
+        "rr_regular": aggregate.get("rr_regular") if aggregate.get("rr_regular") is not None else representative.get("rr_regular"),
+        "rr_variability_ratio": aggregate.get("rr_variability_ratio") or representative.get("rr_variability_ratio"),
+        "qrs_duration_ms_estimate": aggregate.get("qrs_duration_ms_estimate") or representative.get("qrs_duration_ms_estimate"),
         "representative_lead": representative_lead,
         "lead_screens": lead_screens,
-        "lead_layout": "attempted_3x4_standard_layout",
+        "lead_layout": layout_detection["selected_layout"],
+        "layout_detection": layout_detection,
         "calibration": calibration,
         "image_quality": quality_assessment,
         "preprocessing": prepared["metadata"],
+        "aggregate_measurements": aggregate,
         "lead_segmentation_quality": _lead_segmentation_quality(lead_screens),
         "st_screen": st_summary,
     }
@@ -108,7 +119,7 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
         }
 
     signal = _normalize_trace(trace)
-    peaks, _ = find_peaks(signal, distance=max(10, width // 14), prominence=0.25)
+    peaks, polarity = _detect_qrs_candidates(signal, width)
     quality = _digitization_quality(signal, peaks)
 
     if len(peaks) < 2:
@@ -138,6 +149,7 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
     rr_regular = bool(rr_variability is not None and rr_variability < 0.12)
     qrs_ms = _estimate_qrs_ms(signal, peaks, pixels_per_second)
     st_screen = _st_screen(signal, peaks, pixels_per_second)
+    morphology = _lead_morphology(signal, peaks)
 
     return {
         "image_screen_status": "image_waveform_screen_completed",
@@ -146,6 +158,8 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
         "rr_variability_ratio": round(rr_variability, 3) if rr_variability is not None else None,
         "qrs_duration_ms_estimate": qrs_ms,
         "st_screen": st_screen,
+        "qrs_polarity": polarity,
+        "morphology": morphology,
         "digitization_quality": quality,
         "assumptions": {
             "visible_strip_seconds": assumed_seconds,
@@ -157,9 +171,36 @@ def _screen_single_trace(image_gray: np.ndarray, calibration: dict | None = None
     }
 
 
-def _segment_leads(image_gray: np.ndarray) -> dict[str, np.ndarray]:
+def _detect_best_lead_layout(image_gray: np.ndarray, calibration: dict) -> tuple[dict[str, np.ndarray], dict]:
+    candidates = [
+        ("standard_3x4_with_optional_rhythm_strip", _segment_3x4(image_gray)),
+        ("six_by_two", _segment_grid(image_gray, rows=6, cols=2, labels=LEAD_ORDER)),
+        ("stacked_12_lead", _segment_grid(image_gray, rows=12, cols=1, labels=LEAD_ORDER)),
+    ]
+
+    scored = []
+    best_name = candidates[0][0]
+    best_regions = candidates[0][1]
+    best_score = -1.0
+    for name, regions in candidates:
+        score = _layout_candidate_score(regions, calibration)
+        scored.append({"layout": name, **score})
+        numeric_score = float(score["score"])
+        if numeric_score > best_score:
+            best_score = numeric_score
+            best_name = name
+            best_regions = regions
+
+    return best_regions, {
+        "selected_layout": best_name,
+        "layout_confidence": round(max(0.0, min(1.0, best_score)), 3),
+        "candidates": scored,
+    }
+
+
+def _segment_3x4(image_gray: np.ndarray) -> dict[str, np.ndarray]:
     height, width = image_gray.shape[:2]
-    y0, y1 = int(height * 0.08), int(height * 0.86)
+    y0, y1 = int(height * 0.08), int(height * 0.78)
     x0, x1 = int(width * 0.04), int(width * 0.96)
     usable = image_gray[y0:y1, x0:x1]
     h, w = usable.shape[:2]
@@ -177,7 +218,58 @@ def _segment_leads(image_gray: np.ndarray) -> dict[str, np.ndarray]:
                 regions[lead_name] = crop
     if not regions:
         regions["unknown"] = image_gray
+    rhythm_y0 = int(height * 0.78)
+    rhythm_y1 = int(height * 0.96)
+    rhythm = image_gray[rhythm_y0:rhythm_y1, x0:x1]
+    if rhythm.size and rhythm.shape[0] > 40 and rhythm.shape[1] > 400:
+        regions["rhythm_strip"] = rhythm
     return regions
+
+
+def _segment_grid(image_gray: np.ndarray, *, rows: int, cols: int, labels: list[str]) -> dict[str, np.ndarray]:
+    height, width = image_gray.shape[:2]
+    y0, y1 = int(height * 0.06), int(height * 0.94)
+    x0, x1 = int(width * 0.04), int(width * 0.96)
+    usable = image_gray[y0:y1, x0:x1]
+    h, w = usable.shape[:2]
+    row_h = h // rows
+    col_w = w // cols
+    regions = {}
+    label_idx = 0
+    for row_idx in range(rows):
+        for col_idx in range(cols):
+            if label_idx >= len(labels):
+                break
+            ys = row_idx * row_h
+            ye = h if row_idx == rows - 1 else (row_idx + 1) * row_h
+            xs = col_idx * col_w
+            xe = w if col_idx == cols - 1 else (col_idx + 1) * col_w
+            crop = usable[ys:ye, xs:xe]
+            if crop.size:
+                regions[labels[label_idx]] = crop
+            label_idx += 1
+    return regions
+
+
+def _layout_candidate_score(regions: dict[str, np.ndarray], calibration: dict) -> dict:
+    usable = 0
+    qualities = []
+    for crop in regions.values():
+        screen = _screen_single_trace(crop, calibration)
+        quality = float(screen.get("digitization_quality", 0) or 0)
+        qualities.append(quality)
+        if screen.get("image_screen_status") == "image_waveform_screen_completed":
+            usable += 1
+    expected = len([lead for lead in regions if lead != "rhythm_strip"]) or 1
+    usable_ratio = usable / expected
+    mean_quality = float(np.mean(qualities)) if qualities else 0.0
+    score = 0.65 * usable_ratio + 0.35 * mean_quality
+    return {
+        "score": round(float(score), 3),
+        "usable_lead_count": int(usable),
+        "region_count": int(len(regions)),
+        "mean_digitization_quality": round(mean_quality, 3),
+    }
 
 
 def _prepare_ecg_image(image_gray: np.ndarray) -> dict:
@@ -421,11 +513,97 @@ def _lead_segmentation_quality(lead_screens: dict[str, dict]) -> float:
     return round(max(0.0, min(1.0, quality)), 3)
 
 
+def _aggregate_lead_measurements(lead_screens: dict[str, dict]) -> dict:
+    usable = {
+        lead: screen
+        for lead, screen in lead_screens.items()
+        if screen.get("image_screen_status") == "image_waveform_screen_completed"
+    }
+    if not usable:
+        return {
+            "usable_lead_count": 0,
+            "estimated_heart_rate_bpm": None,
+            "rr_regular": None,
+            "qrs_duration_ms_estimate": None,
+            "measurement_consistency": "no_usable_leads",
+        }
+
+    rate_values = [
+        int(screen["estimated_heart_rate_bpm"])
+        for screen in usable.values()
+        if screen.get("estimated_heart_rate_bpm") is not None
+    ]
+    qrs_values = [
+        int(screen["qrs_duration_ms_estimate"])
+        for screen in usable.values()
+        if screen.get("qrs_duration_ms_estimate") is not None
+    ]
+    rr_values = [
+        bool(screen["rr_regular"])
+        for screen in usable.values()
+        if screen.get("rr_regular") is not None
+    ]
+    rr_variability_values = [
+        float(screen["rr_variability_ratio"])
+        for screen in usable.values()
+        if screen.get("rr_variability_ratio") is not None
+    ]
+
+    rhythm_strip = usable.get("rhythm_strip", {})
+    if rhythm_strip.get("estimated_heart_rate_bpm") is not None:
+        rate = int(rhythm_strip["estimated_heart_rate_bpm"])
+        rate_source = "rhythm_strip"
+    elif rate_values:
+        rate = int(round(float(np.median(rate_values))))
+        rate_source = "median_usable_leads"
+    else:
+        rate = None
+        rate_source = "unavailable"
+
+    if rhythm_strip.get("rr_regular") is not None:
+        rr_regular = bool(rhythm_strip["rr_regular"])
+        rr_source = "rhythm_strip"
+    elif rr_values:
+        rr_regular = sum(rr_values) >= max(1, len(rr_values) / 2)
+        rr_source = "majority_usable_leads"
+    else:
+        rr_regular = None
+        rr_source = "unavailable"
+
+    rate_spread = int(max(rate_values) - min(rate_values)) if len(rate_values) > 1 else 0
+    qrs_spread = int(max(qrs_values) - min(qrs_values)) if len(qrs_values) > 1 else 0
+    if rate_spread > 35 or qrs_spread > 60:
+        consistency = "low_consistency_between_leads"
+    elif len(usable) < 4:
+        consistency = "limited_lead_count"
+    else:
+        consistency = "acceptable_screening_consistency"
+
+    return {
+        "usable_lead_count": len(usable),
+        "usable_leads": sorted(usable.keys()),
+        "estimated_heart_rate_bpm": rate,
+        "heart_rate_source": rate_source,
+        "heart_rate_range_bpm": [min(rate_values), max(rate_values)] if rate_values else None,
+        "rr_regular": rr_regular,
+        "rr_regular_source": rr_source,
+        "rr_variability_ratio": round(float(np.median(rr_variability_values)), 3) if rr_variability_values else None,
+        "qrs_duration_ms_estimate": int(round(float(np.median(qrs_values)))) if qrs_values else None,
+        "qrs_duration_range_ms": [min(qrs_values), max(qrs_values)] if qrs_values else None,
+        "measurement_consistency": consistency,
+    }
+
+
 def _territory_st_summary(lead_screens: dict[str, dict]) -> dict:
     possible_leads = {
         lead
         for lead, screen in lead_screens.items()
         if screen.get("st_screen", {}).get("possible_st_elevation")
+    }
+    depression_leads = {
+        lead
+        for lead, screen in lead_screens.items()
+        if screen.get("st_screen", {}).get("possible_st_depression")
     }
     territories = [
         territory
@@ -437,8 +615,69 @@ def _territory_st_summary(lead_screens: dict[str, dict]) -> dict:
         "status": "possible_st_elevation_requires_physician_review" if possible else "no_st_screen_flag",
         "possible_st_elevation": possible,
         "possible_st_elevation_leads": sorted(possible_leads),
+        "possible_st_depression_leads": sorted(depression_leads),
         "possible_territories": territories,
         "method": "unvalidated multi-lead image digitization ST screen",
+    }
+
+
+def _detect_qrs_candidates(signal: np.ndarray, width: int) -> tuple[np.ndarray, str]:
+    distance = max(10, width // 14)
+    positive_peaks, positive_props = find_peaks(signal, distance=distance, prominence=0.25)
+    negative_peaks, negative_props = find_peaks(-signal, distance=distance, prominence=0.25)
+
+    positive_score = float(np.sum(positive_props.get("prominences", []))) if len(positive_peaks) else 0.0
+    negative_score = float(np.sum(negative_props.get("prominences", []))) if len(negative_peaks) else 0.0
+
+    if negative_score > positive_score * 1.15:
+        return negative_peaks, "predominantly_negative"
+    if positive_score > 0:
+        return positive_peaks, "predominantly_positive"
+    return np.array([], dtype=int), "undetermined"
+
+
+def _lead_morphology(signal: np.ndarray, peaks: np.ndarray) -> dict:
+    if len(peaks) == 0:
+        return {
+            "net_qrs_deflection": None,
+            "median_qrs_amplitude": None,
+            "baseline_wander_score": None,
+        }
+
+    amplitudes = []
+    local_baselines = []
+    for peak in peaks[:12]:
+        left = max(0, peak - 20)
+        right = min(len(signal), peak + 21)
+        baseline_left = max(0, peak - 70)
+        baseline_right = max(0, peak - 35)
+        local = signal[left:right]
+        baseline_region = signal[baseline_left:baseline_right]
+        if len(local) and len(baseline_region):
+            baseline = float(np.median(baseline_region))
+            amplitudes.append(float(signal[peak] - baseline))
+            local_baselines.append(baseline)
+
+    if not amplitudes:
+        return {
+            "net_qrs_deflection": None,
+            "median_qrs_amplitude": None,
+            "baseline_wander_score": None,
+        }
+
+    median_amp = float(np.median(amplitudes))
+    if median_amp > 0.12:
+        net = "positive"
+    elif median_amp < -0.12:
+        net = "negative"
+    else:
+        net = "isoelectric_or_low_amplitude"
+
+    wander = float(np.std(local_baselines)) if local_baselines else None
+    return {
+        "net_qrs_deflection": net,
+        "median_qrs_amplitude": round(median_amp, 3),
+        "baseline_wander_score": round(wander, 3) if wander is not None else None,
     }
 
 
@@ -520,9 +759,17 @@ def _st_screen(signal: np.ndarray, peaks: np.ndarray, pixels_per_second: float) 
         return {"status": "insufficient_beats", "possible_st_elevation": False}
     median_delta = float(np.median(values))
     possible = median_delta > 0.18
+    possible_depression = median_delta < -0.18
     return {
-        "status": "possible_st_elevation_requires_physician_review" if possible else "no_st_screen_flag",
+        "status": (
+            "possible_st_elevation_requires_physician_review"
+            if possible
+            else "possible_st_depression_requires_physician_review"
+            if possible_depression
+            else "no_st_screen_flag"
+        ),
         "possible_st_elevation": possible,
+        "possible_st_depression": possible_depression,
         "median_st_delta_screen": round(median_delta, 3),
         "method": "unvalidated image digitization ST screen",
     }

@@ -119,6 +119,8 @@ class ECGPipeline:
         digitization_quality = features.get("digitization_quality")
         calibration = features.get("image_waveform_screen", {}).get("calibration", {})
         lead_segmentation_quality = features.get("image_waveform_screen", {}).get("lead_segmentation_quality")
+        aggregate = features.get("image_waveform_screen", {}).get("aggregate_measurements", {})
+        layout_detection = features.get("image_waveform_screen", {}).get("layout_detection", {})
         image_quality = features.get("image_quality", {})
         quality_warnings = image_quality.get("warnings", [])
         preprocessing = features.get("preprocessing", {})
@@ -161,7 +163,11 @@ class ECGPipeline:
                 ),
                 (
                     f"Estimated heart rate is approximately {estimated_hr} bpm from extracted ECG trace"
-                    + (f" in lead {representative_lead}." if representative_lead else ".")
+                    + (
+                        f" using {aggregate.get('heart_rate_source', 'image trace')}."
+                        if aggregate
+                        else (f" in lead {representative_lead}." if representative_lead else ".")
+                    )
                     if estimated_hr
                     else "Heart rate could not be estimated reliably from this image/PDF."
                 ),
@@ -186,6 +192,18 @@ class ECGPipeline:
                     "PR interval, QT/QTc, and axis cannot be confirmed safely from this ECG image/PDF."
                 ),
                 f"ECG grid calibration: {calibration.get('status', 'not detected')}.",
+                (
+                    f"Usable digitized leads: {aggregate.get('usable_lead_count')}; "
+                    f"measurement consistency: {aggregate.get('measurement_consistency')}."
+                    if aggregate
+                    else "Aggregate lead measurements were unavailable."
+                ),
+                (
+                    f"Detected ECG layout: {layout_detection.get('selected_layout')} "
+                    f"(confidence {layout_detection.get('layout_confidence')})."
+                    if layout_detection
+                    else "ECG layout detection was unavailable."
+                ),
                 (
                     f"Preprocessing applied: contrast normalization, denoising, deskew angle "
                     f"{preprocessing.get('deskew_angle_degrees', 0)} degrees."

@@ -198,6 +198,8 @@ function ECGReport({ result }: { result: any }) {
   const imageQuality = result.measurements?.image_quality || result.measurements?.image_waveform_screen?.image_quality;
   const preprocessing = result.measurements?.preprocessing || result.measurements?.image_waveform_screen?.preprocessing;
   const leadQuality = result.measurements?.image_waveform_screen?.lead_segmentation_quality;
+  const aggregate = result.measurements?.image_waveform_screen?.aggregate_measurements;
+  const layoutDetection = result.measurements?.image_waveform_screen?.layout_detection;
 
   return (
     <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}
@@ -265,6 +267,10 @@ function ECGReport({ result }: { result: any }) {
                 ['Score', imageQuality?.quality_score !== undefined ? `${Math.round(imageQuality.quality_score * 100)}%` : 'Unknown'],
                 ['Grid', imageQuality?.grid_score !== undefined ? `${Math.round(imageQuality.grid_score * 100)}%` : 'Unknown'],
                 ['Lead Split', leadQuality !== undefined ? `${Math.round(leadQuality * 100)}%` : 'Unknown'],
+                ['Usable Leads', aggregate?.usable_lead_count !== undefined ? String(aggregate.usable_lead_count) : 'Unknown'],
+                ['Rate Source', aggregate?.heart_rate_source || 'Unknown'],
+                ['Layout', layoutDetection?.selected_layout || 'Unknown'],
+                ['Layout Conf.', layoutDetection?.layout_confidence !== undefined ? `${Math.round(layoutDetection.layout_confidence * 100)}%` : 'Unknown'],
               ].map(([l, v]) => (
                 <div key={l} className="rounded-lg p-2" style={{ background: 'var(--surface2)', border: '1px solid var(--border)' }}>
                   <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text3)' }}>{l}</div>
@@ -280,6 +286,11 @@ function ECGReport({ result }: { result: any }) {
             {preprocessing && (
               <div className="mt-2 text-[11px]" style={{ color: 'var(--text3)' }}>
                 Deskew {preprocessing.deskew_angle_degrees ?? 0} degrees · processed {preprocessing.processed_shape?.join(' x ') || 'image'}
+              </div>
+            )}
+            {aggregate?.measurement_consistency && (
+              <div className="mt-1 text-[11px]" style={{ color: 'var(--text3)' }}>
+                Cross-lead consistency: {aggregate.measurement_consistency}
               </div>
             )}
           </Section>

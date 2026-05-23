@@ -30,7 +30,11 @@ def test_ecg_image_returns_preliminary_screen(tmp_path):
     assert "calibration" in result["measurements"]["image_waveform_screen"]
     assert "image_quality" in result["measurements"]["image_waveform_screen"]
     assert "preprocessing" in result["measurements"]["image_waveform_screen"]
+    assert "aggregate_measurements" in result["measurements"]["image_waveform_screen"]
+    assert "layout_detection" in result["measurements"]["image_waveform_screen"]
+    assert "rule_engine" in result["measurements"]
     assert "lead_segmentation_quality" in result["measurements"]["image_waveform_screen"]
+    assert "usable_lead_count" in result["measurements"]["image_waveform_screen"]["aggregate_measurements"]
 
 
 def test_xray_image_returns_local_review_screen(tmp_path):
