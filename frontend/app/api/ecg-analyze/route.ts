@@ -73,7 +73,7 @@ Estimate visible heart rate, rhythm regularity, QRS width, visible ST-segment co
 If the picture does not support a measurement, return null or "unable to assess safely".
 Return only JSON.`;
 
-    const pass1 = await runGeminiJson(SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600);
+    const pass1 = await runGeminiJson("pass1", SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600);
 
     const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it and return ONLY JSON:
 {
@@ -86,7 +86,7 @@ Return only JSON.`;
   "requires_physician_review": true
 }`;
 
-    const pass2 = await runGeminiJson(VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900);
+    const pass2 = await runGeminiJson("pass2", VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900);
 
     return NextResponse.json({
       enabled: true,
@@ -109,7 +109,14 @@ Return only JSON.`;
   }
 }
 
-async function runGeminiJson(system: string, imageBase64: string, mediaType: string, prompt: string, maxTokens: number) {
+async function runGeminiJson(
+  mode: "pass1" | "pass2",
+  system: string,
+  imageBase64: string,
+  mediaType: string,
+  prompt: string,
+  maxTokens: number
+) {
   const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -153,8 +160,80 @@ async function runGeminiJson(system: string, imageBase64: string, mediaType: str
   try {
     return parseJsonPayload(text);
   } catch {
-    throw new Error("Gemini ECG verifier returned non-JSON output");
+    return mode === "pass1" ? safePass1FromText(text) : safePass2FromText(text);
   }
+}
+
+function safePass1FromText(text: string) {
+  const summary = compactGeminiText(text);
+  return {
+    rate: { ventricular_bpm: null, atrial_bpm: null },
+    rhythm: {
+      classification: "unable_to_confirm_from_picture",
+      regularity: "unknown",
+      origin: "unknown",
+    },
+    axis: { qrs_axis_degrees: null, axis_label: "indeterminate" },
+    intervals: { PR_ms: null, QRS_ms: null, QT_ms: null, QTc_ms: null },
+    waveform: {
+      p_wave: "Unable to verify safely from Gemini non-JSON output.",
+      qrs_complex: "Unable to measure safely from Gemini non-JSON output.",
+      st_segment: {
+        elevation_leads: [],
+        depression_leads: [],
+        description: "Unable to convert Gemini output into structured ST findings safely.",
+      },
+      t_wave: "Unable to verify safely from Gemini non-JSON output.",
+      u_wave: null,
+    },
+    lead_findings: emptyLeadFindings("Not structured by Gemini; physician review required."),
+    interpretation: summary || "Gemini reviewed the ECG picture but did not return structured JSON. Treat as unable to interpret safely.",
+    differential_diagnoses: [],
+    critical_findings: [],
+    confidence: "low",
+    confidence_reason: "Gemini returned non-JSON output, so measurements and findings were not accepted as structured clinical data.",
+    recommended_action: "Review the uploaded ECG picture manually and confirm with a physician/cardiologist.",
+    image_quality: "poor",
+    safety_note: "AI-assisted picture review only. Not a definitive ECG diagnosis.",
+    parser_status: "gemini_non_json_fallback",
+    raw_gemini_text: summary,
+  };
+}
+
+function safePass2FromText(text: string) {
+  const summary = compactGeminiText(text);
+  return {
+    agreement: "partial",
+    verified_findings: [],
+    corrections: ["Gemini verification returned non-JSON text, so no structured corrections were accepted."],
+    additional_findings: [],
+    final_confidence: "low",
+    summary: summary || "Gemini verification was not returned in structured format. Physician review is required.",
+    requires_physician_review: true,
+    parser_status: "gemini_non_json_fallback",
+    raw_gemini_text: summary,
+  };
+}
+
+function emptyLeadFindings(value: string) {
+  return {
+    I: value,
+    II: value,
+    III: value,
+    aVR: value,
+    aVL: value,
+    aVF: value,
+    V1: value,
+    V2: value,
+    V3: value,
+    V4: value,
+    V5: value,
+    V6: value,
+  };
+}
+
+function compactGeminiText(text: string) {
+  return text.replace(/\s+/g, " ").trim().slice(0, 1200);
 }
 
 function parseJsonPayload(text: string) {
