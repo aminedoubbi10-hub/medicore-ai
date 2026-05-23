@@ -142,6 +142,7 @@ async function runGeminiJson(
         temperature: 0,
         maxOutputTokens: maxTokens,
         responseMimeType: "application/json",
+        responseSchema: mode === "pass1" ? PASS1_SCHEMA : PASS2_SCHEMA,
       },
     }),
   });
@@ -160,7 +161,58 @@ async function runGeminiJson(
   try {
     return parseJsonPayload(text);
   } catch {
+    const repaired = await repairGeminiJson(mode, text);
+    if (repaired) return repaired;
     return mode === "pass1" ? safePass1FromText(text) : safePass2FromText(text);
+  }
+}
+
+async function repairGeminiJson(mode: "pass1" | "pass2", rawText: string) {
+  const schema = mode === "pass1" ? PASS1_SCHEMA : PASS2_SCHEMA;
+  const target = mode === "pass1" ? "ECG pass 1 interpretation JSON" : "ECG pass 2 verification JSON";
+  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [
+          {
+            text: "Convert the supplied ECG verifier text into the requested JSON object. Do not add measurements or findings that are not present. Use null, empty arrays, unknown, or low confidence when uncertain. Return JSON only.",
+          },
+        ],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Target: ${target}\n\nRaw Gemini ECG text:\n${compactGeminiText(rawText)}`,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: mode === "pass1" ? 1600 : 900,
+        responseMimeType: "application/json",
+        responseSchema: schema,
+      },
+    }),
+  });
+
+  if (!response.ok) return null;
+
+  const payload = await response.json();
+  const text = (payload.candidates?.[0]?.content?.parts || [])
+    .map((part: any) => part.text || "")
+    .join("")
+    .replace(/```json|```/g, "")
+    .trim();
+
+  try {
+    return parseJsonPayload(text);
+  } catch {
+    return null;
   }
 }
 
@@ -235,6 +287,139 @@ function emptyLeadFindings(value: string) {
 function compactGeminiText(text: string) {
   return text.replace(/\s+/g, " ").trim().slice(0, 1200);
 }
+
+const PASS1_SCHEMA = {
+  type: "object",
+  properties: {
+    rate: {
+      type: "object",
+      properties: {
+        ventricular_bpm: { type: "number", nullable: true },
+        atrial_bpm: { type: "number", nullable: true },
+      },
+      required: ["ventricular_bpm", "atrial_bpm"],
+    },
+    rhythm: {
+      type: "object",
+      properties: {
+        classification: { type: "string" },
+        regularity: {
+          type: "string",
+          enum: ["regular", "irregular", "regularly_irregular", "irregularly_irregular", "unknown"],
+        },
+        origin: {
+          type: "string",
+          enum: ["sinus", "atrial", "junctional", "ventricular", "paced", "unknown"],
+        },
+      },
+      required: ["classification", "regularity", "origin"],
+    },
+    axis: {
+      type: "object",
+      properties: {
+        qrs_axis_degrees: { type: "number", nullable: true },
+        axis_label: {
+          type: "string",
+          enum: ["normal", "left_deviation", "right_deviation", "extreme_right", "indeterminate"],
+        },
+      },
+      required: ["qrs_axis_degrees", "axis_label"],
+    },
+    intervals: {
+      type: "object",
+      properties: {
+        PR_ms: { type: "number", nullable: true },
+        QRS_ms: { type: "number", nullable: true },
+        QT_ms: { type: "number", nullable: true },
+        QTc_ms: { type: "number", nullable: true },
+      },
+      required: ["PR_ms", "QRS_ms", "QT_ms", "QTc_ms"],
+    },
+    waveform: {
+      type: "object",
+      properties: {
+        p_wave: { type: "string" },
+        qrs_complex: { type: "string" },
+        st_segment: {
+          type: "object",
+          properties: {
+            elevation_leads: { type: "array", items: { type: "string" } },
+            depression_leads: { type: "array", items: { type: "string" } },
+            description: { type: "string" },
+          },
+          required: ["elevation_leads", "depression_leads", "description"],
+        },
+        t_wave: { type: "string" },
+        u_wave: { type: "string", nullable: true },
+      },
+      required: ["p_wave", "qrs_complex", "st_segment", "t_wave", "u_wave"],
+    },
+    lead_findings: {
+      type: "object",
+      properties: {
+        I: { type: "string" },
+        II: { type: "string" },
+        III: { type: "string" },
+        aVR: { type: "string" },
+        aVL: { type: "string" },
+        aVF: { type: "string" },
+        V1: { type: "string" },
+        V2: { type: "string" },
+        V3: { type: "string" },
+        V4: { type: "string" },
+        V5: { type: "string" },
+        V6: { type: "string" },
+      },
+      required: ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"],
+    },
+    interpretation: { type: "string" },
+    differential_diagnoses: { type: "array", items: { type: "string" } },
+    critical_findings: { type: "array", items: { type: "string" } },
+    confidence: { type: "string", enum: ["high", "medium", "low"] },
+    confidence_reason: { type: "string" },
+    recommended_action: { type: "string" },
+    image_quality: { type: "string", enum: ["good", "acceptable", "poor"] },
+    safety_note: { type: "string" },
+  },
+  required: [
+    "rate",
+    "rhythm",
+    "axis",
+    "intervals",
+    "waveform",
+    "lead_findings",
+    "interpretation",
+    "differential_diagnoses",
+    "critical_findings",
+    "confidence",
+    "confidence_reason",
+    "recommended_action",
+    "image_quality",
+    "safety_note",
+  ],
+};
+
+const PASS2_SCHEMA = {
+  type: "object",
+  properties: {
+    agreement: { type: "string", enum: ["full", "partial", "disagree"] },
+    verified_findings: { type: "array", items: { type: "string" } },
+    corrections: { type: "array", items: { type: "string" } },
+    additional_findings: { type: "array", items: { type: "string" } },
+    final_confidence: { type: "string", enum: ["high", "medium", "low"] },
+    summary: { type: "string" },
+    requires_physician_review: { type: "boolean" },
+  },
+  required: [
+    "agreement",
+    "verified_findings",
+    "corrections",
+    "additional_findings",
+    "final_confidence",
+    "summary",
+    "requires_physician_review",
+  ],
+};
 
 function parseJsonPayload(text: string) {
   const cleaned = text
