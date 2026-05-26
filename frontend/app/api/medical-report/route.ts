@@ -5,6 +5,7 @@ export const runtime = "nodejs";
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const REQUESTED_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const GEMINI_MODEL_FALLBACKS = Array.from(new Set([REQUESTED_GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]));
+const REPORT_PROMPT_VERSION = "medical_report_composer_v1.1";
 
 type UploadedFile = {
   name: string;
@@ -40,7 +41,12 @@ export async function POST(req: NextRequest) {
         files,
         maxTokens: 2200,
       });
-      return NextResponse.json({ success: true, model: result.model, extractedText: result.text });
+      return NextResponse.json({
+        success: true,
+        model: result.model,
+        extractedText: result.text,
+        trace: buildTrace({ model: result.model, documentType, files, mode: "extract" }),
+      });
     }
 
     const result = await runGeminiText({
@@ -54,6 +60,7 @@ export async function POST(req: NextRequest) {
       success: true,
       model: result.model,
       reportText: cleanReportText(result.text),
+      trace: buildTrace({ model: result.model, documentType, files, mode: "generate" }),
     });
   } catch (err: any) {
     return NextResponse.json({
@@ -162,10 +169,16 @@ ${extractedText || "No OCR text provided. If files are attached, inspect them di
 Lab results text:
 ${labsText || "No lab values provided."}
 
+Use this report template and keep these headings:
+${templateFor(documentType)}
+
 Requirements:
-- Write a concise structured report with headings.
+- Write a concise structured report with professional headings.
 - Include ECG, lab, radiology/scanner/report interpretation paragraphs when information is present.
-- Add one short conclusion paragraph.
+- Interpret lab values with units and reference-range caution if supplied; flag critical values conservatively.
+- For ECG: include rhythm/rate/interval/ST-T only if visible or supplied; otherwise say unable to assess safely.
+- For scanner/radiology: distinguish findings, impression, and recommendation; require radiologist confirmation.
+- Add one short integrated conclusion paragraph.
 - Be medically conservative.
 - State uncertainty clearly.
 - Do not invent findings, measurements, diagnoses, or normality.
@@ -173,6 +186,71 @@ Requirements:
 - If the source is insufficient, say "insufficient data for safe interpretation".
 - Do not claim FDA/CE validation.
 - Return plain text only, no markdown table.`;
+}
+
+function templateFor(documentType: string) {
+  if (documentType === "ecg") {
+    return `AI-ASSISTED ECG REPORT DRAFT
+Clinical context
+Source quality / limitations
+ECG interpretation
+Safety flags / urgent review considerations
+Conclusion
+Required physician validation`;
+  }
+  if (documentType === "labs") {
+    return `AI-ASSISTED LAB INTERPRETATION DRAFT
+Clinical context
+Reported laboratory values
+Abnormal / critical values
+Interpretive paragraph
+Conclusion
+Required physician validation`;
+  }
+  if (documentType === "xray" || documentType === "scanner") {
+    return `AI-ASSISTED RADIOLOGY / SCANNER REPORT DRAFT
+Clinical context
+Technique / source quality
+Findings
+Impression
+Recommendation
+Conclusion
+Required radiologist validation`;
+  }
+  return `AI-ASSISTED MEDICAL REPORT DRAFT
+Clinical context
+Source documents reviewed
+Extracted findings
+ECG paragraph, if present
+Laboratory paragraph, if present
+Radiology / scanner paragraph, if present
+Integrated conclusion
+Required physician validation`;
+}
+
+function buildTrace({
+  model,
+  documentType,
+  files,
+  mode,
+}: {
+  model: string;
+  documentType: string;
+  files: UploadedFile[];
+  mode: string;
+}) {
+  return {
+    request_id: crypto.randomUUID(),
+    generated_at: new Date().toISOString(),
+    mode,
+    prompt_version: REPORT_PROMPT_VERSION,
+    requested_model: REQUESTED_GEMINI_MODEL,
+    model_used: model,
+    document_type: documentType,
+    file_count: files.length,
+    file_names: files.map((file) => file.name),
+    safety_policy: "draft_only_requires_physician_validation_no_fabricated_findings",
+  };
 }
 
 function cleanReportText(text: string) {

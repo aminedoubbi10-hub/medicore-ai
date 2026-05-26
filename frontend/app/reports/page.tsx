@@ -3,7 +3,7 @@
 import { useCallback, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { AnimatePresence, motion } from 'framer-motion';
-import { AlertTriangle, Clipboard, FileImage, FileText, Loader2, Upload, Wand2 } from 'lucide-react';
+import { AlertTriangle, Clipboard, FileImage, FileText, Loader2, Save, ShieldCheck, Upload, Wand2 } from 'lucide-react';
 import { toast } from 'sonner';
 
 type ComposerFile = {
@@ -31,6 +31,7 @@ export default function ReportsPage() {
   const [extractedText, setExtractedText] = useState('');
   const [reportText, setReportText] = useState('');
   const [model, setModel] = useState('');
+  const [trace, setTrace] = useState<any>(null);
   const [extracting, setExtracting] = useState(false);
   const [generating, setGenerating] = useState(false);
 
@@ -72,6 +73,7 @@ export default function ReportsPage() {
       if (!data.success) throw new Error(data.error || 'OCR extraction failed');
       setExtractedText(data.extractedText || '');
       setModel(data.model || '');
+      setTrace(data.trace || null);
       toast.success('Text extracted');
     } catch (err: any) {
       toast.error(err.message || 'Unable to extract text');
@@ -99,6 +101,7 @@ export default function ReportsPage() {
       if (!data.success) throw new Error(data.error || 'Report generation failed');
       setReportText(data.reportText || '');
       setModel(data.model || model);
+      setTrace(data.trace || null);
       toast.success('Medical report draft generated');
     } catch (err: any) {
       toast.error(err.message || 'Unable to generate report');
@@ -114,6 +117,24 @@ export default function ReportsPage() {
     }
     await navigator.clipboard.writeText(reportText);
     toast.success('Report copied');
+  };
+
+  const saveDraft = () => {
+    if (!reportText.trim()) {
+      toast.error('No report to save yet');
+      return;
+    }
+    localStorage.setItem('medicore_latest_report_draft', JSON.stringify({
+      reportText,
+      extractedText,
+      labsText,
+      clinicalContext,
+      documentType,
+      language,
+      trace,
+      savedAt: new Date().toISOString(),
+    }));
+    toast.success('Draft saved locally');
   };
 
   return (
@@ -259,6 +280,12 @@ export default function ReportsPage() {
                 <Clipboard className="w-3.5 h-3.5" />
                 Copy report
               </button>
+              <button onClick={saveDraft}
+                className="px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5"
+                style={{ background: 'var(--surface2)', border: '1px solid var(--border2)', color: 'var(--text2)' }}>
+                <Save className="w-3.5 h-3.5" />
+                Save draft
+              </button>
               <button onClick={generate} disabled={generating}
                 className="px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
                 style={{ background: 'linear-gradient(135deg,var(--accent2),#005588)', color: 'white' }}>
@@ -267,6 +294,31 @@ export default function ReportsPage() {
               </button>
             </div>
           </Panel>
+
+          {trace && (
+            <Panel title="Traceability">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                {[
+                  ['Request ID', trace.request_id],
+                  ['Prompt version', trace.prompt_version],
+                  ['Model used', trace.model_used],
+                  ['Document type', trace.document_type],
+                  ['Generated at', trace.generated_at ? new Date(trace.generated_at).toLocaleString() : 'unknown'],
+                  ['Files', trace.file_names?.join(', ') || 'none'],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-lg p-2" style={{ background: 'var(--bg3)', border: '1px solid var(--border)' }}>
+                    <div className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text3)' }}>{label}</div>
+                    <div className="break-words" style={{ color: 'var(--text2)' }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 flex gap-2 p-2.5 rounded-lg text-xs"
+                style={{ background: 'rgba(0,229,160,0.06)', border: '1px solid rgba(0,229,160,0.18)', color: '#00e5a0' }}>
+                <ShieldCheck className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                <span>{trace.safety_policy || 'Draft only; physician validation required.'}</span>
+              </div>
+            </Panel>
+          )}
         </div>
       </div>
     </div>
