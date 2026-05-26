@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const REQUESTED_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL_FALLBACKS = Array.from(
+  new Set([REQUESTED_GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"].filter(Boolean))
+);
 
 const SYSTEM_PROMPT = `You are an ECG clinical decision-support verifier.
 You are NOT a replacement for a cardiologist and you must not claim definitive diagnosis.
@@ -75,9 +78,8 @@ Estimate visible heart rate, rhythm regularity, QRS width, visible ST-segment co
 If the picture does not support a measurement, return null or "unable to assess safely".
 Return only JSON.`;
 
-    const pass1 = normalizePass1(
-      await runGeminiJson("pass1", SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600)
-    );
+    const pass1Result = await runGeminiJson("pass1", SYSTEM_PROMPT, imageBase64, mediaType, pass1Prompt, 1600);
+    const pass1 = normalizePass1(pass1Result.data);
 
     const pass2Prompt = `A first pass returned this JSON:\n${JSON.stringify(pass1, null, 2)}\n\nIndependently verify it against the attached ECG picture. Do not rely only on the text above. Return ONLY JSON:
 {
@@ -90,14 +92,14 @@ Return only JSON.`;
   "requires_physician_review": true
 }`;
 
-    const pass2 = normalizePass2(
-      await runGeminiJson("pass2", VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900)
-    );
+    const pass2Result = await runGeminiJson("pass2", VERIFY_SYSTEM, imageBase64, mediaType, pass2Prompt, 900);
+    const pass2 = normalizePass2(pass2Result.data);
 
     return NextResponse.json({
       enabled: true,
       provider: "gemini",
-      model: GEMINI_MODEL,
+      model: pass2Result.model || pass1Result.model,
+      requested_model: REQUESTED_GEMINI_MODEL,
       pass1,
       pass2,
       safety: {
@@ -123,7 +125,31 @@ async function runGeminiJson(
   prompt: string,
   maxTokens: number
 ) {
-  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+  const errors: string[] = [];
+  for (const model of GEMINI_MODEL_FALLBACKS) {
+    try {
+      const data = await runGeminiJsonWithModel(model, mode, system, imageBase64, mediaType, prompt, maxTokens);
+      return { data, model };
+    } catch (err: any) {
+      errors.push(`${model}: ${err?.message || "request failed"}`);
+      if (!isQuotaOrModelError(err?.message || "")) {
+        break;
+      }
+    }
+  }
+  throw new Error(errors.join(" | ") || "Gemini ECG verifier request failed");
+}
+
+async function runGeminiJsonWithModel(
+  model: string,
+  mode: "pass1" | "pass2",
+  system: string,
+  imageBase64: string,
+  mediaType: string,
+  prompt: string,
+  maxTokens: number
+) {
+  const response = await fetch(`${GEMINI_API_URL}/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -167,15 +193,16 @@ async function runGeminiJson(
   try {
     return parseJsonPayload(text);
   } catch {
-    const imageRetry = await retryGeminiImageJson(mode, system, imageBase64, mediaType, prompt, maxTokens);
+    const imageRetry = await retryGeminiImageJson(model, mode, system, imageBase64, mediaType, prompt, maxTokens);
     if (imageRetry) return imageRetry;
-    const repaired = await repairGeminiJson(mode, text);
+    const repaired = await repairGeminiJson(model, mode, text);
     if (repaired) return repaired;
     return mode === "pass1" ? safePass1FromText(text) : safePass2FromText(text);
   }
 }
 
 async function retryGeminiImageJson(
+  model: string,
   mode: "pass1" | "pass2",
   system: string,
   imageBase64: string,
@@ -196,7 +223,7 @@ Return a complete JSON object only. Do not mention truncated input text.
 Required task:
 ${originalPrompt}`;
 
-  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+  const response = await fetch(`${GEMINI_API_URL}/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -242,10 +269,10 @@ ${originalPrompt}`;
   }
 }
 
-async function repairGeminiJson(mode: "pass1" | "pass2", rawText: string) {
+async function repairGeminiJson(model: string, mode: "pass1" | "pass2", rawText: string) {
   const schema = mode === "pass1" ? PASS1_SCHEMA : PASS2_SCHEMA;
   const target = mode === "pass1" ? "ECG pass 1 interpretation JSON" : "ECG pass 2 verification JSON";
-  const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+  const response = await fetch(`${GEMINI_API_URL}/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -429,6 +456,10 @@ function sanitizeStringArray(value: unknown) {
 
 function isWeakInputTextAnswer(text: string) {
   return /truncated text|input text|incomplete input data|incomplete data provided|provided input/i.test(text);
+}
+
+function isQuotaOrModelError(message: string) {
+  return /quota|rate.?limit|free_tier|limit: 0|not found|not supported|model/i.test(message);
 }
 
 const PASS1_SCHEMA = {
