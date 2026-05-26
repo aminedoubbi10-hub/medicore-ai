@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, Zap, AlertTriangle, CheckCircle, Activity, Circle } from 'lucide-react';
+import { Upload, Zap, AlertTriangle, CheckCircle, Activity, Circle, FileImage, ShieldCheck, Stethoscope } from 'lucide-react';
 import { ecgAPI } from '@/lib/api';
 import { applyCardioRules, ECGRuleAlerts } from '@/lib/ecg-rules';
 import { toast } from 'sonner';
@@ -61,6 +61,7 @@ async function runVisualVerifier(file: File, clinicalContext: string) {
 
 export default function ECGPage() {
   const [file, setFile]         = useState<File | null>(null);
+  const [preview, setPreview]   = useState<string | null>(null);
   const [state, setState]       = useState<State>('idle');
   const [result, setResult]     = useState<any>(null);
   const [step, setStep]         = useState(0);
@@ -68,7 +69,14 @@ export default function ECGPage() {
   const [clinicalNotes, setClinicalNotes] = useState('58F, chest pain, HTN, DM');
 
   const onDrop = useCallback((accepted: File[]) => {
-    if (accepted[0]) { setFile(accepted[0]); setResult(null); setState('idle'); setStep(0); }
+    if (accepted[0]) {
+      const nextFile = accepted[0];
+      setFile(nextFile);
+      setPreview(nextFile.type.startsWith('image/') ? URL.createObjectURL(nextFile) : null);
+      setResult(null);
+      setState('idle');
+      setStep(0);
+    }
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -149,15 +157,35 @@ export default function ECGPage() {
   };
 
   return (
-    <div>
-      {/* Disclaimer */}
-      <div className="mb-4 flex gap-2 p-3 rounded-xl text-xs"
-        style={{ background: 'rgba(255,179,71,0.07)', border: '1px solid rgba(255,179,71,0.2)', color: '#ffb347' }}>
-        <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-        <span><strong>Clinical Decision Support Only.</strong> AI findings must be confirmed by a licensed physician. Not a replacement for clinical judgment.</span>
+    <div className="space-y-5">
+      <div className="flex flex-col xl:flex-row xl:items-end justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold" style={{ color: 'var(--accent)' }}>
+            <Stethoscope className="w-3.5 h-3.5" />
+            ECG interpretation workspace
+          </div>
+          <h2 className="mt-1 text-2xl font-black" style={{ fontFamily: 'Syne' }}>
+            Picture-based ECG screening
+          </h2>
+          <p className="mt-1 text-sm max-w-2xl" style={{ color: 'var(--text2)' }}>
+            Upload an ECG picture for backend image screening, Gemini visual verification, rule flags, and cardiologist review.
+          </p>
+        </div>
+
+        <div className="flex gap-2 text-[11px]">
+          <StatusPill label="Backend screen" tone="green" />
+          <StatusPill label="Gemini verifier" tone="blue" />
+          <StatusPill label="Physician review" tone="amber" />
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div className="flex gap-2 p-3 rounded-xl text-xs"
+        style={{ background: 'rgba(255,179,71,0.07)', border: '1px solid rgba(255,179,71,0.2)', color: '#ffb347' }}>
+        <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+        <span><strong>Clinical decision support only.</strong> AI findings must be confirmed by a licensed physician. Not a replacement for clinical judgment.</span>
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-[420px_minmax(0,1fr)] gap-5">
         {/* Left: upload */}
         <div className="space-y-4">
           <div className="rounded-xl p-5" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
@@ -182,6 +210,16 @@ export default function ECGPage() {
                 ))}
               </div>
             </div>
+
+            {preview && (
+              <div className="mt-4 rounded-xl overflow-hidden" style={{ background: 'var(--bg3)', border: '1px solid var(--border)' }}>
+                <div className="px-3 py-2 flex items-center justify-between text-xs" style={{ borderBottom: '1px solid var(--border)' }}>
+                  <span className="font-semibold flex items-center gap-1.5"><FileImage className="w-3.5 h-3.5" /> ECG preview</span>
+                  <span style={{ color: 'var(--text3)' }}>{Math.round((file?.size || 0) / 1024)} KB</span>
+                </div>
+                <img src={preview} alt="Uploaded ECG preview" className="w-full max-h-72 object-contain" style={{ background: '#07101f' }} />
+              </div>
+            )}
 
             <div className="mt-4 grid grid-cols-2 gap-3">
               <div>
@@ -237,7 +275,7 @@ export default function ECGPage() {
           {state === 'complete' && result ? (
             <ECGReport result={result} />
           ) : (
-            <div className="rounded-xl flex items-center justify-center h-full min-h-80"
+            <div className="rounded-xl flex items-center justify-center h-full min-h-[520px]"
               style={{ background: 'rgba(15,26,46,0.4)', border: '1px dashed var(--border)' }}>
               <div className="text-center" style={{ color: 'var(--text3)' }}>
                 <Activity className="w-12 h-12 mx-auto mb-3 opacity-30" />
@@ -256,6 +294,13 @@ function ECGReport({ result }: { result: any }) {
   const urgency = result.urgency || 'routine';
   const uc = urgencyColors[urgency] || '#00e5a0';
   const confidence = result.confidence ?? result.confidence_score ?? 0;
+  const gemini = result.visualVerification?.enabled ? result.visualVerification.pass1 : null;
+  const geminiPass2 = result.visualVerification?.enabled ? result.visualVerification.pass2 : null;
+  const displayRate = gemini?.rate?.ventricular_bpm ? `${Math.round(gemini.rate.ventricular_bpm)} bpm` : result.heartRate || 'Not safely measured';
+  const displayRhythm = gemini?.rhythm?.classification || result.rhythm || 'Unable to determine safely';
+  const displayQrs = gemini?.intervals?.QRS_ms ? `${Math.round(gemini.intervals.QRS_ms)} ms` : result.qrsDuration || 'Not safely measured';
+  const displayQtc = gemini?.intervals?.QTc_ms ? `${Math.round(gemini.intervals.QTc_ms)} ms` : result.qtInterval || 'Not safely measured';
+  const displayQuality = gemini?.image_quality || result.measurements?.image_quality?.status || 'Unknown';
   const studyId = result.study_id || result.measurements?.study_id;
   const imageQuality = result.measurements?.image_quality || result.measurements?.image_waveform_screen?.image_quality;
   const preprocessing = result.measurements?.preprocessing || result.measurements?.image_waveform_screen?.preprocessing;
@@ -332,6 +377,63 @@ function ECGReport({ result }: { result: any }) {
       )}
 
       <div className="p-4 space-y-4 text-xs">
+        <Section title="Clinical Snapshot" titleColor="#00e5a0">
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+            <SnapshotCard label="Rhythm" value={displayRhythm} tone="blue" />
+            <SnapshotCard label="Rate" value={displayRate} tone="green" />
+            <SnapshotCard label="QRS" value={displayQrs} tone="amber" />
+            <SnapshotCard label="QT / QTc" value={displayQtc} tone="amber" />
+            <SnapshotCard label="Image" value={displayQuality} tone={displayQuality === 'poor' ? 'red' : 'blue'} />
+          </div>
+        </Section>
+
+        {gemini && (
+          <Section title="Gemini ECG Impression" titleColor="#00d4ff">
+            <div className="rounded-xl p-4" style={{ background: 'rgba(0,212,255,0.05)', border: '1px solid rgba(0,212,255,0.18)' }}>
+              <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm leading-relaxed" style={{ color: 'var(--text)' }}>
+                    {gemini.interpretation || 'No structured Gemini impression returned.'}
+                  </div>
+                  <div className="mt-2 text-[11px]" style={{ color: 'var(--text3)' }}>
+                    {gemini.confidence_reason || 'Confidence reason unavailable.'}
+                  </div>
+                </div>
+                <span className="px-2.5 py-1 rounded text-[10px] font-bold uppercase flex-shrink-0"
+                  style={{
+                    background: gemini.confidence === 'high' ? 'rgba(0,229,160,0.12)' : gemini.confidence === 'medium' ? 'rgba(255,179,71,0.12)' : 'rgba(255,77,109,0.12)',
+                    color: gemini.confidence === 'high' ? '#00e5a0' : gemini.confidence === 'medium' ? '#ffb347' : '#ff4d6d',
+                    border: `1px solid ${gemini.confidence === 'high' ? 'rgba(0,229,160,0.3)' : gemini.confidence === 'medium' ? 'rgba(255,179,71,0.3)' : 'rgba(255,77,109,0.3)'}`,
+                  }}>
+                  {gemini.confidence || 'low'} confidence
+                </span>
+              </div>
+              {gemini.recommended_action && (
+                <div className="mt-3 p-2 rounded-lg" style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text2)' }}>
+                  <span className="font-semibold" style={{ color: 'var(--accent)' }}>Recommended action: </span>
+                  {gemini.recommended_action}
+                </div>
+              )}
+            </div>
+          </Section>
+        )}
+
+        {geminiPass2?.summary && (
+          <Section title="Verification" titleColor="#a78bfa">
+            <div className="rounded-xl p-3" style={{ background: 'rgba(167,139,250,0.06)', border: '1px solid rgba(167,139,250,0.2)' }}>
+              <div className="flex items-center gap-2 mb-1">
+                <ShieldCheck className="w-4 h-4" style={{ color: 'var(--purple)' }} />
+                <span className="font-semibold">Second pass: {geminiPass2.agreement || 'unknown agreement'}</span>
+              </div>
+              <div style={{ color: 'var(--text2)' }}>{geminiPass2.summary}</div>
+            </div>
+          </Section>
+        )}
+
+        {result.clientRuleAlerts && (
+          <RuleAlertSection title="Safety Rule Flags" alerts={result.clientRuleAlerts} />
+        )}
+
         {/* Measurements */}
         <Section title="Measurements">
           <div className="grid grid-cols-2 gap-1.5">
@@ -412,10 +514,6 @@ function ECGReport({ result }: { result: any }) {
               ))}
             </div>
           </Section>
-        )}
-
-        {result.clientRuleAlerts && (
-          <RuleAlertSection title="Client Safety Rule Engine" alerts={result.clientRuleAlerts} />
         )}
 
         {result.visualVerification && (
@@ -552,6 +650,27 @@ function Section({ title, titleColor, children }: { title: string; titleColor?: 
         <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
       </div>
       {children}
+    </div>
+  );
+}
+
+function StatusPill({ label, tone }: { label: string; tone: 'green' | 'blue' | 'amber' }) {
+  const color = tone === 'green' ? '#00e5a0' : tone === 'amber' ? '#ffb347' : '#00d4ff';
+  return (
+    <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full"
+      style={{ background: `${color}12`, border: `1px solid ${color}35`, color }}>
+      <span className="w-1.5 h-1.5 rounded-full" style={{ background: color }} />
+      {label}
+    </div>
+  );
+}
+
+function SnapshotCard({ label, value, tone }: { label: string; value: string; tone: 'green' | 'blue' | 'amber' | 'red' }) {
+  const color = tone === 'green' ? '#00e5a0' : tone === 'amber' ? '#ffb347' : tone === 'red' ? '#ff4d6d' : '#00d4ff';
+  return (
+    <div className="rounded-xl p-3 min-h-20" style={{ background: 'var(--surface2)', border: `1px solid ${color}35` }}>
+      <div className="text-[10px] uppercase tracking-widest mb-1" style={{ color: 'var(--text3)' }}>{label}</div>
+      <div className="text-sm font-semibold leading-snug" style={{ color }}>{value}</div>
     </div>
   );
 }
